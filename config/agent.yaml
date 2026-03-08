@@ -1,0 +1,92 @@
+# DoDo AegisOps Agent — Default Configuration
+# Override values via remote config pull (every 60s).
+
+endpoint:
+  address: "kong.aegisops.io:443"
+  timeout_ms: 5000
+  retry_max: 3
+  retry_backoff_ms: 1000
+
+tls:
+  ca_cert_path: "/etc/aegis/certs/ca.pem"
+  client_cert_path: "/etc/aegis/certs/agent.pem"
+  client_key_path: "/etc/aegis/certs/agent-key.pem"
+  verify_server: true
+
+buffer:
+  path: "/var/lib/aegis/buffer"
+  max_size_bytes: 536870912  # 512 MB
+  flush_interval_ms: 5000
+  max_batch_size: 500
+
+logging:
+  level: "info"
+  output: "stdout"
+  file_path: ""
+
+config_pull_interval_seconds: 60
+agent_id_path: "/var/lib/aegis/agent_id"
+
+labels: {}
+
+redaction_patterns: []
+
+collectors:
+  - name: cpu
+    enabled: true
+    interval_seconds: 5
+
+  - name: memory
+    enabled: true
+    interval_seconds: 5
+
+  - name: disk
+    enabled: true
+    interval_seconds: 10
+
+  - name: network
+    enabled: true
+    interval_seconds: 5
+
+  - name: process
+    enabled: true
+    interval_seconds: 10
+
+  - name: security
+    enabled: true
+    interval_seconds: 15
+    parameters:
+      monitored_files: "/etc/passwd,/etc/shadow,/etc/sudoers,/etc/ssh/sshd_config"
+
+  - name: certs
+    enabled: true
+    interval_seconds: 3600
+    parameters:
+      scan_paths: "/etc/ssl/certs,/etc/pki/tls/certs"
+
+  - name: logs
+    enabled: true
+    interval_seconds: 1
+    parameters:
+      paths: "/var/log/syslog,/var/log/messages"
+      max_line_bytes: "16384"
+
+  - name: otel
+    enabled: false
+    interval_seconds: 1
+
+  - name: kubernetes
+    enabled: true
+    interval_seconds: 15
+
+  - name: inventory
+    enabled: true
+    interval_seconds: 3600
+
+  - name: self_metrics
+    enabled: true
+    interval_seconds: 30
+
+  - name: heartbeat
+    enabled: true
+    interval_seconds: 30

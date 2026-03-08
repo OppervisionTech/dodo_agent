@@ -1,0 +1,57 @@
+.PHONY: fmt lint test build-linux build-windows build-lite clean check
+
+# Formatting
+fmt:
+	cargo fmt --all
+
+# Linting
+lint:
+	cargo clippy --features linux -- -D warnings
+
+# Run tests
+test:
+	cargo test --features linux --all
+
+# Check compilation (all variants)
+check:
+	cargo check --features linux
+	cargo check --features windows
+	cargo check --features lite
+
+# Build Linux variant (default)
+build-linux:
+	cargo build --release --features linux
+	@echo "Built: target/release/aegis-agent"
+
+# Build Windows variant
+build-windows:
+	cargo build --release --features windows --target x86_64-pc-windows-gnu
+	@echo "Built: target/x86_64-pc-windows-gnu/release/aegis-agent.exe"
+
+# Build Lite variant (IoT/Edge)
+build-lite:
+	cargo build --release --features lite
+	@echo "Built: target/release/aegis-agent (lite)"
+
+# Build static Linux binary with musl
+build-static:
+	cargo build --release --features linux --target x86_64-unknown-linux-musl
+	@echo "Built: target/x86_64-unknown-linux-musl/release/aegis-agent"
+
+# Build for ARM (cross-compilation)
+build-arm:
+	cross build --release --features lite --target aarch64-unknown-linux-musl
+	@echo "Built: target/aarch64-unknown-linux-musl/release/aegis-agent"
+
+# Clean build artifacts
+clean:
+	cargo clean
+
+# Run with default config (dev mode)
+run:
+	AEGIS_CONFIG=config/agent.yaml RUST_LOG=debug cargo run --features linux
+
+# Generate checksums for release binaries
+checksums:
+	@cd target/release && sha256sum aegis-agent > aegis-agent.sha256 2>/dev/null || true
+	@echo "Checksums generated"

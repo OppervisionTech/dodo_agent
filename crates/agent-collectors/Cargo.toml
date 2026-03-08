@@ -1,0 +1,29 @@
+[package]
+name = "agent-collectors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+ebpf = ["dep:agent-ebpf"]
+
+[dependencies]
+agent-core = { workspace = true }
+agent-platform = { workspace = true }
+agent-ebpf = { workspace = true, optional = true }
+tokio = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+x509-parser = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

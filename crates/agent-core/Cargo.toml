@@ -1,0 +1,24 @@
+[package]
+name = "agent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-platform = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+regex = { workspace = true }
+zstd = { workspace = true }
+lz4_flex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
