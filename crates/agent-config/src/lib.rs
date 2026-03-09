@@ -274,6 +274,30 @@ fn default_collectors() -> Vec<CollectorLocalConfig> {
             interval_seconds: 30,
             parameters: Default::default(),
         },
+        CollectorLocalConfig {
+            name: "docker".into(),
+            enabled: true,
+            interval_seconds: 10,
+            parameters: Default::default(),
+        },
+        CollectorLocalConfig {
+            name: "postgres".into(),
+            enabled: true,
+            interval_seconds: 15,
+            parameters: Default::default(),
+        },
+        CollectorLocalConfig {
+            name: "mongodb".into(),
+            enabled: true,
+            interval_seconds: 15,
+            parameters: Default::default(),
+        },
+        CollectorLocalConfig {
+            name: "redis".into(),
+            enabled: true,
+            interval_seconds: 10,
+            parameters: Default::default(),
+        },
     ]
 }
 

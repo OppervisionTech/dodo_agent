@@ -55,6 +55,11 @@ regex = "1"
 
 # HTTP (for cloud metadata, OTEL HTTP)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+axum = "0.7"
+
+# Database clients (feature-gated in agent-collectors)
+tokio-postgres = "0.7"
+mongodb = "2"
 
 # TLS
 rustls = "0.23"
@@ -81,17 +86,36 @@ rust-version.workspace = true
 
 [features]
 default = ["linux"]
+# Collector features (binary-level, propagated to agent-collectors)
+otel = ["agent-collectors/otel"]
+docker = ["agent-collectors/docker"]
+postgres = ["agent-collectors/postgres"]
+mongodb = ["agent-collectors/mongodb"]
+redis-collector = ["agent-collectors/redis-collector"]
+
 linux = [
     "agent-platform/linux",
     "agent-ebpf/enabled",
     "agent-collectors/ebpf",
+    "otel",
+    "docker",
+    "postgres",
+    "mongodb",
+    "redis-collector",
     "dep:agent-ebpf",
 ]
 windows = [
     "agent-platform/windows",
+    "otel",
+    "docker",
+    "postgres",
+    "mongodb",
+    "redis-collector",
 ]
 lite = [
     "agent-platform/lite",
+    "docker",
+    "redis-collector",
 ]
 
 [dependencies]

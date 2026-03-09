@@ -99,6 +99,54 @@ pub fn log_envelope(
 }
 
 // ---------------------------------------------------------------------------
+// Trace envelope
+// ---------------------------------------------------------------------------
+
+/// Create a trace envelope from span data.
+pub fn trace_envelope(
+    trace_id: &str,
+    span_id: &str,
+    parent_span_id: &str,
+    operation_name: &str,
+    service_name: &str,
+    kind: &str,
+    start_time_unix_ns: i64,
+    end_time_unix_ns: i64,
+    attributes: &[(&str, &str)],
+    status_code: &str,
+) -> Envelope {
+    let ts = now_unix_ns();
+    let attr_map: HashMap<String, String> = attributes
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let payload = serde_json::json!({
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "parent_span_id": parent_span_id,
+        "operation_name": operation_name,
+        "service_name": service_name,
+        "kind": kind,
+        "start_time_unix_ns": start_time_unix_ns,
+        "end_time_unix_ns": end_time_unix_ns,
+        "duration_ns": end_time_unix_ns.saturating_sub(start_time_unix_ns),
+        "attributes": attr_map,
+        "status_code": status_code,
+        "source": "otel",
+        "timestamp_unix_ns": ts,
+    });
+
+    Envelope {
+        signal_type: SignalType::Trace,
+        payload: serde_json::to_vec(&payload).unwrap_or_default(),
+        timestamp_unix_ns: ts,
+        buffered: false,
+        retry_count: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Event envelope
 // ---------------------------------------------------------------------------
 

@@ -90,3 +90,29 @@ collectors:
   - name: heartbeat
     enabled: true
     interval_seconds: 30
+
+  # Integration collectors (HU260-263)
+  # These activate automatically when their services are detected/configured.
+
+  - name: docker
+    enabled: true
+    interval_seconds: 10
+    # Auto-detects /var/run/docker.sock; inactive if not found.
+
+  - name: postgres
+    enabled: true
+    interval_seconds: 15
+    # Set DODO_AGENT_POSTGRES_DSN env var to activate.
+    # Example: postgresql://monitor:pass@localhost:5432/mydb
+
+  - name: mongodb
+    enabled: true
+    interval_seconds: 15
+    # Set DODO_AGENT_MONGODB_URI env var to activate.
+    # Example: mongodb://monitor:pass@localhost:27017
+
+  - name: redis
+    enabled: true
+    interval_seconds: 10
+    # Set DODO_AGENT_REDIS_URL env var to activate.
+    # Example: redis://:password@localhost:6379

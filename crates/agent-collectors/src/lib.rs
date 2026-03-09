@@ -20,6 +20,16 @@ pub mod process;
 pub mod security;
 pub mod self_metrics;
 
+// Feature-gated collectors (HU260-263)
+#[cfg(feature = "docker")]
+pub mod docker;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+#[cfg(feature = "mongodb")]
+pub mod mongodb_collector;
+#[cfg(feature = "redis-collector")]
+pub mod redis_collector;
+
 // Re-export collector structs for convenient access
 pub use certs::CertsCollector;
 pub use cpu::CpuCollector;
@@ -34,3 +44,12 @@ pub use otel::OtelCollector;
 pub use process::ProcessCollector;
 pub use security::SecurityCollector;
 pub use self_metrics::SelfMetricsCollector;
+
+#[cfg(feature = "docker")]
+pub use docker::DockerCollector;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresCollector;
+#[cfg(feature = "mongodb")]
+pub use mongodb_collector::MongodbCollector;
+#[cfg(feature = "redis-collector")]
+pub use redis_collector::RedisCollector;

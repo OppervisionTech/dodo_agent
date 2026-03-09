@@ -396,8 +396,12 @@ fn register_collectors(
                 )));
             }
             "otel" => {
+                let rate_limit = cc
+                    .parameters
+                    .get("rate_limit")
+                    .and_then(|s| s.parse().ok());
                 registry.register(Box::new(agent_collectors::OtelCollector::new(
-                    platform.clone(),
+                    rate_limit,
                 )));
             }
             "kubernetes" => {
@@ -420,6 +424,30 @@ fn register_collectors(
             "heartbeat" => {
                 registry.register(Box::new(agent_collectors::HeartbeatCollector::new(
                     agent_state.clone(),
+                )));
+            }
+            #[cfg(feature = "docker")]
+            "docker" => {
+                registry.register(Box::new(agent_collectors::DockerCollector::new(
+                    agent_state.host_id.clone(),
+                )));
+            }
+            #[cfg(feature = "postgres")]
+            "postgres" => {
+                registry.register(Box::new(agent_collectors::PostgresCollector::new(
+                    agent_state.host_id.clone(),
+                )));
+            }
+            #[cfg(feature = "mongodb")]
+            "mongodb" => {
+                registry.register(Box::new(agent_collectors::MongodbCollector::new(
+                    agent_state.host_id.clone(),
+                )));
+            }
+            #[cfg(feature = "redis-collector")]
+            "redis" => {
+                registry.register(Box::new(agent_collectors::RedisCollector::new(
+                    agent_state.host_id.clone(),
                 )));
             }
             unknown => {

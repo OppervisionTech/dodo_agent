@@ -7,13 +7,21 @@ rust-version.workspace = true
 [features]
 default = []
 ebpf = ["dep:agent-ebpf"]
+otel = ["dep:axum", "dep:prost-types"]
+docker = []
+postgres = ["dep:tokio-postgres"]
+mongodb = ["dep:mongodb"]
+redis-collector = []
 
 [dependencies]
 agent-core = { workspace = true }
 agent-platform = { workspace = true }
 agent-ebpf = { workspace = true, optional = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
 prost = { workspace = true }
+prost-types = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -24,6 +32,13 @@ uuid = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 x509-parser = { workspace = true }
+
+# OTEL HTTP listener
+axum = { workspace = true, optional = true }
+
+# Database clients (optional, feature-gated)
+tokio-postgres = { workspace = true, optional = true }
+mongodb = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
