@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: oppervision/aegis-agent
+
+jobs:
+  build-binaries:
+    name: Build ${{ matrix.variant }}-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - variant: linux
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+            binary: aegis-agent
+          - variant: linux
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+            binary: aegis-agent
+          - variant: lite
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+            binary: aegis-agent-lite
+          - variant: lite
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+            binary: aegis-agent-lite
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.variant }}-${{ matrix.arch }}
+
+      - name: Install cross-compilation tools
+        if: matrix.arch == 'arm64'
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: matrix.arch == 'amd64'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo build --release --features ${{ matrix.variant }} --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.arch == 'arm64'
+        run: cross build --release --features ${{ matrix.variant }} --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/aegis-agent dist/${{ matrix.binary }}
+          cd dist
+          sha256sum ${{ matrix.binary }} > ${{ matrix.binary }}.sha256
+          tar -czf aegis-agent-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz ${{ matrix.binary }}
+          sha256sum aegis-agent-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz > aegis-agent-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz.sha256
+
+      - name: Verify static linking
+        if: matrix.arch == 'amd64'
+        run: |
+          file dist/${{ matrix.binary }}
+          ldd dist/${{ matrix.binary }} 2>&1 | grep -q "not a dynamic executable" || \
+            ldd dist/${{ matrix.binary }} 2>&1 | grep -q "statically linked" || \
+            echo "WARNING: Binary may not be fully static"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}-${{ matrix.arch }}
+          path: dist/
+
+  docker:
+    name: Docker Image
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, docker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            cp "${dir}"*.tar.gz release/ 2>/dev/null || true
+            cp "${dir}"*.sha256 release/ 2>/dev/null || true
+          done
+          # Global checksums file
+          cat release/*.sha256 > release/checksums.sha256
+
+      - name: Copy install script
+        run: cp scripts/install.sh release/install.sh
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            **One-liner install:**
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo bash
+            ```
+
+            **Manual install:**
+            1. Download the archive for your platform
+            2. Extract: `tar -xzf aegis-agent-linux-amd64.tar.gz`
+            3. Run: `sudo ./install.sh`
+
+            **Docker:**
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ```

@@ -1,0 +1,11 @@
+target/
+dist/
+.git/
+.github/
+docs/
+tests/
+*.md
+Makefile
+.gitignore
+.claudeignore
+.dockerignore

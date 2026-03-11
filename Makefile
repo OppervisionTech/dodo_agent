@@ -1,4 +1,5 @@
-.PHONY: fmt lint test build-linux build-windows build-lite clean check
+.PHONY: fmt lint test build-linux build-windows build-lite clean check \
+       dist dist-linux-amd64 dist-linux-arm64 docker install
 
 # Formatting
 fmt:
@@ -55,3 +56,25 @@ run:
 checksums:
 	@cd target/release && sha256sum aegis-agent > aegis-agent.sha256 2>/dev/null || true
 	@echo "Checksums generated"
+
+# Cross-compile all release targets via build.sh
+dist:
+	./scripts/build.sh all
+
+# Cross-compile individual targets
+dist-linux-amd64:
+	./scripts/build.sh linux-amd64
+
+dist-linux-arm64:
+	USE_CROSS=1 ./scripts/build.sh linux-arm64
+
+# Docker build
+docker:
+	docker build -t aegis-agent:latest .
+
+docker-lite:
+	docker build --build-arg VARIANT=lite -t aegis-agent-lite:latest .
+
+# Install locally (requires root)
+install:
+	sudo ./scripts/install.sh
