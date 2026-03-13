@@ -29,17 +29,17 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CollectorError {
-    #[error("collection failed for {collector}: {reason}")]
-    Failed { collector: String, reason: String },
+    #[error("collection failed: {0}")]
+    Failed(String),
 
-    #[error("collector timed out: {0}")]
-    Timeout(String),
+    #[error("collector timed out")]
+    Timeout,
 
     #[error("platform error: {0}")]
     Platform(#[from] agent_platform::PlatformError),
 
     #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
 
     #[error("serialization error: {0}")]
     Serialization(String),

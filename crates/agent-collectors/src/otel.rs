@@ -40,7 +40,7 @@ const DEFAULT_RATE_LIMIT_PER_SEC: u64 = 50_000;
 pub(crate) mod otlp {
     // ---- Common ----
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct KeyValue {
         #[prost(string, tag = "1")]
         pub key: String,
@@ -48,7 +48,7 @@ pub(crate) mod otlp {
         pub value: Option<AnyValue>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct AnyValue {
         #[prost(oneof = "any_value::Value", tags = "1, 2, 3, 4, 7")]
         pub value: Option<any_value::Value>,
@@ -70,13 +70,13 @@ pub(crate) mod otlp {
         }
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct Resource {
         #[prost(message, repeated, tag = "1")]
         pub attributes: Vec<KeyValue>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct InstrumentationScope {
         #[prost(string, tag = "1")]
         pub name: String,
@@ -86,19 +86,19 @@ pub(crate) mod otlp {
 
     // ---- Trace ----
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ExportTraceServiceRequest {
         #[prost(message, repeated, tag = "1")]
         pub resource_spans: Vec<ResourceSpans>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ExportTraceServiceResponse {
         #[prost(message, optional, tag = "1")]
         pub partial_success: Option<ExportTracePartialSuccess>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ExportTracePartialSuccess {
         #[prost(int64, tag = "1")]
         pub rejected_spans: i64,
@@ -106,7 +106,7 @@ pub(crate) mod otlp {
         pub error_message: String,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ResourceSpans {
         #[prost(message, optional, tag = "1")]
         pub resource: Option<Resource>,
@@ -114,7 +114,7 @@ pub(crate) mod otlp {
         pub scope_spans: Vec<ScopeSpans>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ScopeSpans {
         #[prost(message, optional, tag = "1")]
         pub scope: Option<InstrumentationScope>,
@@ -122,7 +122,7 @@ pub(crate) mod otlp {
         pub spans: Vec<Span>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct Span {
         #[prost(bytes, tag = "1")]
         pub trace_id: Vec<u8>,
@@ -157,7 +157,7 @@ pub(crate) mod otlp {
         Consumer = 5,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct SpanStatus {
         #[prost(string, tag = "2")]
         pub message: String,
@@ -175,19 +175,19 @@ pub(crate) mod otlp {
 
     // ---- Metrics ----
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ExportMetricsServiceRequest {
         #[prost(message, repeated, tag = "1")]
         pub resource_metrics: Vec<ResourceMetrics>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ExportMetricsServiceResponse {
         #[prost(message, optional, tag = "1")]
         pub partial_success: Option<ExportMetricsPartialSuccess>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ExportMetricsPartialSuccess {
         #[prost(int64, tag = "1")]
         pub rejected_data_points: i64,
@@ -195,7 +195,7 @@ pub(crate) mod otlp {
         pub error_message: String,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ResourceMetrics {
         #[prost(message, optional, tag = "1")]
         pub resource: Option<Resource>,
@@ -203,7 +203,7 @@ pub(crate) mod otlp {
         pub scope_metrics: Vec<ScopeMetrics>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ScopeMetrics {
         #[prost(message, optional, tag = "1")]
         pub scope: Option<InstrumentationScope>,
@@ -211,7 +211,7 @@ pub(crate) mod otlp {
         pub metrics: Vec<Metric>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct Metric {
         #[prost(string, tag = "1")]
         pub name: String,
@@ -235,13 +235,13 @@ pub(crate) mod otlp {
         }
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct Gauge {
         #[prost(message, repeated, tag = "1")]
         pub data_points: Vec<NumberDataPoint>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct Sum {
         #[prost(message, repeated, tag = "1")]
         pub data_points: Vec<NumberDataPoint>,
@@ -249,13 +249,13 @@ pub(crate) mod otlp {
         pub is_monotonic: bool,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct Histogram {
         #[prost(message, repeated, tag = "1")]
         pub data_points: Vec<HistogramDataPoint>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct NumberDataPoint {
         #[prost(message, repeated, tag = "7")]
         pub attributes: Vec<KeyValue>,
@@ -275,7 +275,7 @@ pub(crate) mod otlp {
         }
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct HistogramDataPoint {
         #[prost(message, repeated, tag = "9")]
         pub attributes: Vec<KeyValue>,
@@ -293,19 +293,19 @@ pub(crate) mod otlp {
 
     // ---- Logs ----
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ExportLogsServiceRequest {
         #[prost(message, repeated, tag = "1")]
         pub resource_logs: Vec<ResourceLogs>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ExportLogsServiceResponse {
         #[prost(message, optional, tag = "1")]
         pub partial_success: Option<ExportLogsPartialSuccess>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ExportLogsPartialSuccess {
         #[prost(int64, tag = "1")]
         pub rejected_log_records: i64,
@@ -313,7 +313,7 @@ pub(crate) mod otlp {
         pub error_message: String,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ResourceLogs {
         #[prost(message, optional, tag = "1")]
         pub resource: Option<Resource>,
@@ -321,7 +321,7 @@ pub(crate) mod otlp {
         pub scope_logs: Vec<ScopeLogs>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct ScopeLogs {
         #[prost(message, optional, tag = "1")]
         pub scope: Option<InstrumentationScope>,
@@ -329,7 +329,7 @@ pub(crate) mod otlp {
         pub log_records: Vec<LogRecord>,
     }
 
-    #[derive(Clone, Default, prost::Message)]
+    #[derive(Clone, prost::Message)]
     pub struct LogRecord {
         #[prost(fixed64, tag = "1")]
         pub time_unix_nano: u64,
@@ -720,11 +720,6 @@ mod grpc_server {
         shared: Arc<OtelShared>,
     }
 
-    #[tonic::async_trait]
-    impl tonic::server::NamedService for OtlpGrpc {
-        const NAME: &'static str = "opentelemetry.proto.collector";
-    }
-
     pub async fn run(
         shared: Arc<OtelShared>,
         cancel: CancellationToken,
@@ -737,21 +732,9 @@ mod grpc_server {
             "OTEL gRPC MUST bind to loopback only"
         );
 
-        let handler = OtlpGrpc {
+        let handler = Arc::new(OtlpGrpc {
             shared: shared.clone(),
-        };
-        let handler = Arc::new(handler);
-
-        let trace_handler = handler.clone();
-        let metrics_handler = handler.clone();
-        let logs_handler = handler.clone();
-
-        // Build tonic server with unary handlers
-        let trace_svc = tonic::transport::Server::builder()
-            .add_service(tonic::service::interceptor(
-                tonic::transport::Server::builder().into_service(),
-                |req| Ok(req),
-            ));
+        });
 
         // Use raw hyper to handle gRPC (simpler than building full tonic services)
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -793,9 +776,11 @@ mod grpc_server {
             }
         });
 
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .http2_only()
+        let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .http2_only();
+        builder
             .serve_connection(io, service)
+            .into_owned()
             .await?;
 
         Ok(())
@@ -805,12 +790,14 @@ mod grpc_server {
         async fn handle_request(
             &self,
             req: hyper::Request<hyper::body::Incoming>,
-        ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, hyper::Error> {
+        ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, std::convert::Infallible> {
+            use http_body_util::BodyExt;
+
             let path = req.uri().path().to_string();
-            let body = http_body_util::BodyExt::collect(req.into_body())
-                .await
-                .map(|b| b.to_bytes())
-                .unwrap_or_default();
+            let body = match BodyExt::collect(req.into_body()).await {
+                Ok(b) => b.to_bytes(),
+                Err(_) => hyper::body::Bytes::new(),
+            };
 
             // Strip gRPC frame header (5 bytes: 1 byte compress flag + 4 bytes length)
             let payload = if body.len() > 5 { &body[5..] } else { &body[..] };

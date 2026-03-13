@@ -1,4 +1,5 @@
 use thiserror::Error;
+use tracing::{info, warn};
 
 #[derive(Error, Debug)]
 pub enum EbpfError {

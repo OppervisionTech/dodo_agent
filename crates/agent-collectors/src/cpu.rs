@@ -62,10 +62,9 @@ impl Collector for CpuCollector {
             // ------------------------------------------------------------------
             let cpu_times = self.platform.cpu_times()?;
             if cpu_times.is_empty() {
-                return Err(CollectorError::Failed {
-                    collector: "cpu".into(),
-                    reason: "no CPU time samples returned by platform".into(),
-                });
+                return Err(CollectorError::Failed(
+                    "cpu: no CPU time samples returned by platform".into(),
+                ));
             }
 
             let aggregate = &cpu_times[0];
