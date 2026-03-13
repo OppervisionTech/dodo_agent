@@ -1,0 +1,108 @@
+# DoDo AegisOps Agent — Local Development Configuration
+# Usage: AEGIS_CONFIG=config/agent-dev.yaml cargo run
+
+endpoint:
+  address: "localhost:50051"
+  timeout_ms: 5000
+  retry_max: 3
+  retry_backoff_ms: 1000
+
+tls:
+  enabled: false
+  ca_cert_path: ""
+  client_cert_path: ""
+  client_key_path: ""
+  verify_server: false
+
+buffer:
+  path: "/tmp/aegis-buffer"
+  max_size_bytes: 52428800  # 50 MB (smaller for dev)
+  flush_interval_ms: 5000
+  max_batch_size: 100
+
+logging:
+  level: "debug"
+  output: "stdout"
+  file_path: ""
+
+config_pull_interval_seconds: 0
+agent_id_path: "/tmp/aegis-agent-id"
+
+labels:
+  environment: "dev"
+  hostname: "linux-dev"
+
+redaction_patterns: []
+
+collectors:
+  - name: cpu
+    enabled: true
+    interval_seconds: 5
+
+  - name: memory
+    enabled: true
+    interval_seconds: 5
+
+  - name: disk
+    enabled: true
+    interval_seconds: 10
+
+  - name: network
+    enabled: true
+    interval_seconds: 5
+
+  - name: process
+    enabled: true
+    interval_seconds: 10
+
+  - name: logs
+    enabled: true
+    interval_seconds: 1
+    parameters:
+      paths: "/var/log/syslog,/var/log/messages"
+      max_line_bytes: "16384"
+
+  - name: heartbeat
+    enabled: true
+    interval_seconds: 30
+
+  - name: self_metrics
+    enabled: true
+    interval_seconds: 30
+
+  - name: inventory
+    enabled: true
+    interval_seconds: 3600
+
+  # Disabled for dev (no K8s, no eBPF needed)
+  - name: kubernetes
+    enabled: false
+    interval_seconds: 15
+
+  - name: security
+    enabled: false
+    interval_seconds: 15
+
+  - name: certs
+    enabled: false
+    interval_seconds: 3600
+
+  - name: otel
+    enabled: false
+    interval_seconds: 1
+
+  - name: docker
+    enabled: true
+    interval_seconds: 10
+
+  - name: postgres
+    enabled: false
+    interval_seconds: 15
+
+  - name: mongodb
+    enabled: false
+    interval_seconds: 15
+
+  - name: redis
+    enabled: false
+    interval_seconds: 10

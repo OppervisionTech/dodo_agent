@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
         timeout_ms: config.endpoint.timeout_ms,
         retry_max: config.endpoint.retry_max,
         retry_backoff_ms: config.endpoint.retry_backoff_ms,
+        tls_enabled: config.tls.enabled,
         ca_cert_path: config.tls.ca_cert_path.clone(),
         client_cert_path: config.tls.client_cert_path.clone(),
         client_key_path: config.tls.client_key_path.clone(),

@@ -107,6 +107,8 @@ impl Default for EndpointLocalConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TlsLocalConfig {
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub ca_cert_path: String,
     #[serde(default)]
@@ -124,6 +126,7 @@ fn bool_true() -> bool {
 impl Default for TlsLocalConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             ca_cert_path: "/etc/aegis/certs/ca.pem".to_string(),
             client_cert_path: "/etc/aegis/certs/agent.pem".to_string(),
             client_key_path: "/etc/aegis/certs/agent-key.pem".to_string(),
