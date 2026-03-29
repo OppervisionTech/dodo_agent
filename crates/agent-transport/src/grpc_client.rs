@@ -1,5 +1,6 @@
+use crate::proto::{self, IngestorServiceClient};
 use crate::retry::{with_retry, RetryConfig};
-use crate::{SubmitResult, TransportConfig, TransportResult};
+use crate::{SubmitResult, TransportConfig, TransportError, TransportResult};
 use agent_core::Envelope;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -45,10 +46,7 @@ impl GrpcClient {
         let batch_size = envelopes.len();
         let start = std::time::Instant::now();
 
-        // Build protobuf batch request (simplified — in production this would use
-        // the generated proto types from dodo_proto)
-        let payload_bytes = Self::serialize_batch(&envelopes, agent_state);
-        let payload_size = payload_bytes.len();
+        let proto_envelopes = Self::build_proto_envelopes(&envelopes, agent_state);
 
         let retry_config = RetryConfig {
             max_retries: self.config.retry_max,
@@ -56,11 +54,11 @@ impl GrpcClient {
         };
 
         let result = with_retry(&retry_config, "submit_batch", || {
-            let payload = payload_bytes.clone();
+            let batch = proto_envelopes.clone();
             let this = &self;
             async move {
                 let channel = this.ensure_connected().await?;
-                this.do_submit(channel, payload).await
+                this.do_submit(channel, batch).await
             }
         })
         .await;
@@ -72,7 +70,6 @@ impl GrpcClient {
                     batch_size = batch_size,
                     accepted = r.accepted,
                     rejected = r.rejected,
-                    payload_bytes = payload_size,
                     latency_ms = elapsed.as_millis() as u64,
                     "batch submitted successfully"
                 );
@@ -95,33 +92,57 @@ impl GrpcClient {
 
     async fn do_submit(
         &self,
-        _channel: tonic::transport::Channel,
-        _payload: Vec<u8>,
+        channel: tonic::transport::Channel,
+        envelopes: Vec<proto::AgentEnvelope>,
     ) -> TransportResult<SubmitResult> {
-        // In production, this calls IngestorServiceClient::submit_batch.
-        // For now, we simulate the call structure:
-        //
-        // let mut client = IngestorServiceClient::new(channel);
-        // let request = tonic::Request::new(SubmitBatchRequest { envelopes: ... });
-        // let response = client.submit_batch(request).await?;
-
-        // Placeholder: will be connected to actual proto client when integrating
-        // with dodo_proto generated code
+        let mut client = IngestorServiceClient::new(channel);
+        let request = tonic::Request::new(proto::SubmitBatchRequest { envelopes });
+        let response = client.submit_batch(request).await.map_err(|e| {
+            TransportError::Grpc {
+                code: e.code().to_string(),
+                message: e.message().to_string(),
+            }
+        })?;
+        let resp = response.into_inner();
         Ok(SubmitResult {
-            accepted: 0,
-            rejected: 0,
-            errors: vec!["not connected to real ingestor".to_string()],
+            accepted: resp.accepted,
+            rejected: resp.rejected,
+            errors: resp.errors,
         })
     }
 
-    fn serialize_batch(envelopes: &[Envelope], _agent_state: &agent_core::AgentState) -> Vec<u8> {
-        // Placeholder serialization — in production this builds proper protobuf
-        // AgentEnvelope messages with all header fields populated from agent_state
-        let mut buf = Vec::new();
-        for env in envelopes {
-            buf.extend_from_slice(&env.payload);
-        }
-        buf
+    fn build_proto_envelopes(
+        envelopes: &[Envelope],
+        agent_state: &agent_core::AgentState,
+    ) -> Vec<proto::AgentEnvelope> {
+        envelopes
+            .iter()
+            .map(|env| proto::AgentEnvelope {
+                agent_id: agent_state.agent_id.clone(),
+                agent_version: agent_state.agent_version.clone(),
+                agent_variant: agent_state.agent_variant.clone(),
+                host_id: agent_state.host_id.clone(),
+                hostname: agent_state.hostname.clone(),
+                os_family: agent_state.os_family.clone(),
+                cluster_id: String::new(),
+                timestamp_unix_ns: env.timestamp_unix_ns,
+                sequence_id: 0,
+                signal_type: match env.signal_type {
+                    agent_core::SignalType::Metric => proto::SignalType::Metric as i32,
+                    agent_core::SignalType::Log => proto::SignalType::Log as i32,
+                    agent_core::SignalType::Trace => proto::SignalType::Trace as i32,
+                    agent_core::SignalType::Event => proto::SignalType::Event as i32,
+                    agent_core::SignalType::Inventory => proto::SignalType::Inventory as i32,
+                    agent_core::SignalType::Heartbeat => proto::SignalType::Heartbeat as i32,
+                    agent_core::SignalType::SecurityEvent => proto::SignalType::SecurityEvent as i32,
+                    agent_core::SignalType::CustomEvent => proto::SignalType::CustomEvent as i32,
+                },
+                payload: env.payload.clone(),
+                compression: proto::Compression::None as i32,
+                buffered: env.buffered,
+                retry_count: env.retry_count,
+            })
+            .collect()
     }
 
     /// Disconnect and clean up.

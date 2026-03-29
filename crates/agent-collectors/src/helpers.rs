@@ -1,14 +1,105 @@
 //! Helper functions for constructing Envelope instances.
 //!
-//! Provides factory functions for each signal type so that collectors
-//! can focus on data collection logic rather than boilerplate serialization.
-//! For MVP, payloads are serialized as JSON. In production these will be
-//! converted to protobuf via the dodo_proto schemas.
+//! Payloads are serialized as protobuf matching the dodo_proto schemas,
+//! so that downstream workers can deserialize them directly.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 use agent_core::{Envelope, SignalType};
+use prost::Message;
+
+// ---------------------------------------------------------------------------
+// Protobuf types matching dodo.proto.v1
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetricPayload {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(double, tag = "2")]
+    pub value: f64,
+    #[prost(map = "string, string", tag = "3")]
+    pub labels: HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    #[prost(int64, tag = "4")]
+    pub timestamp_unix_ns: i64,
+    #[prost(enumeration = "MetricType", tag = "5")]
+    pub metric_type: i32,
+    #[prost(string, tag = "6")]
+    pub unit: ::prost::alloc::string::String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MetricBatch {
+    #[prost(message, repeated, tag = "1")]
+    pub metrics: Vec<MetricPayload>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MetricType {
+    Unspecified = 0,
+    Gauge = 1,
+    Counter = 2,
+    Histogram = 3,
+    Summary = 4,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HeartbeatPayload {
+    #[prost(string, tag = "1")]
+    pub agent_version: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub uptime_seconds: u64,
+    #[prost(string, tag = "3")]
+    pub config_hash: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "4")]
+    pub collectors_active: Vec<::prost::alloc::string::String>,
+    #[prost(double, tag = "5")]
+    pub buffer_used_mb: f64,
+    #[prost(uint64, tag = "6")]
+    pub send_errors_total: u64,
+    #[prost(uint64, tag = "7")]
+    pub redactions_total: u64,
+    #[prost(uint64, tag = "8")]
+    pub envelopes_sent_total: u64,
+    #[prost(double, tag = "9")]
+    pub cpu_usage_percent: f64,
+    #[prost(double, tag = "10")]
+    pub memory_usage_mb: f64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LogPayload {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub level: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(map = "string, string", tag = "4")]
+    pub fields: HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    #[prost(string, tag = "5")]
+    pub trace_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub span_id: ::prost::alloc::string::String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InventoryPayload {
+    #[prost(string, tag = "1")]
+    pub hostname: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub os_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub kernel_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub architecture: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "13")]
+    pub cpu_cores: u64,
+    #[prost(uint64, tag = "14")]
+    pub total_memory_bytes: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Timestamp helper
@@ -41,17 +132,26 @@ pub fn metric_envelope(
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-    let payload = serde_json::json!({
-        "name": name,
-        "value": value,
-        "labels": label_map,
-        "metric_type": metric_type,
-        "timestamp_unix_ns": ts,
-    });
+    let mt = match metric_type {
+        "gauge" => MetricType::Gauge,
+        "counter" => MetricType::Counter,
+        "histogram" => MetricType::Histogram,
+        "summary" => MetricType::Summary,
+        _ => MetricType::Gauge,
+    };
+
+    let payload = MetricPayload {
+        name: name.to_string(),
+        value,
+        labels: label_map,
+        timestamp_unix_ns: ts,
+        metric_type: mt as i32,
+        unit: String::new(),
+    };
 
     Envelope {
         signal_type: SignalType::Metric,
-        payload: serde_json::to_vec(&payload).unwrap_or_default(),
+        payload: payload.encode_to_vec(),
         timestamp_unix_ns: ts,
         buffered: false,
         retry_count: 0,
@@ -63,8 +163,6 @@ pub fn metric_envelope(
 // ---------------------------------------------------------------------------
 
 /// Create a log envelope from raw log data.
-///
-/// `severity` should be one of: "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL".
 pub fn log_envelope(
     message: &str,
     severity: &str,
@@ -74,23 +172,45 @@ pub fn log_envelope(
     span_id: Option<&str>,
 ) -> Envelope {
     let ts = now_unix_ns();
-    let attr_map: HashMap<String, String> = attributes
+    let fields: HashMap<String, String> = attributes
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
+    let payload = LogPayload {
+        message: message.to_string(),
+        level: severity.to_string(),
+        source: source.to_string(),
+        fields,
+        trace_id: trace_id.unwrap_or("").to_string(),
+        span_id: span_id.unwrap_or("").to_string(),
+    };
+
+    Envelope {
+        signal_type: SignalType::Log,
+        payload: payload.encode_to_vec(),
+        timestamp_unix_ns: ts,
+        buffered: false,
+        retry_count: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event envelope
+// ---------------------------------------------------------------------------
+
+/// Create a generic event envelope.
+pub fn event_envelope(event_type: &str, summary: &str, details: serde_json::Value) -> Envelope {
+    let ts = now_unix_ns();
     let payload = serde_json::json!({
-        "message": message,
-        "severity": severity,
-        "source": source,
-        "attributes": attr_map,
-        "trace_id": trace_id,
-        "span_id": span_id,
+        "event_type": event_type,
+        "summary": summary,
+        "details": details,
         "timestamp_unix_ns": ts,
     });
 
     Envelope {
-        signal_type: SignalType::Log,
+        signal_type: SignalType::Event,
         payload: serde_json::to_vec(&payload).unwrap_or_default(),
         timestamp_unix_ns: ts,
         buffered: false,
@@ -99,7 +219,95 @@ pub fn log_envelope(
 }
 
 // ---------------------------------------------------------------------------
-// Trace envelope
+// Security event envelope
+// ---------------------------------------------------------------------------
+
+/// Create a security event envelope.
+pub fn security_event_envelope(
+    event_type: &str,
+    severity: &str,
+    summary: &str,
+    details: serde_json::Value,
+) -> Envelope {
+    let ts = now_unix_ns();
+    let payload = serde_json::json!({
+        "event_type": event_type,
+        "severity": severity,
+        "summary": summary,
+        "details": details,
+        "timestamp_unix_ns": ts,
+    });
+
+    Envelope {
+        signal_type: SignalType::SecurityEvent,
+        payload: serde_json::to_vec(&payload).unwrap_or_default(),
+        timestamp_unix_ns: ts,
+        buffered: false,
+        retry_count: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inventory envelope
+// ---------------------------------------------------------------------------
+
+/// Create an inventory envelope.
+pub fn inventory_envelope(inventory_type: &str, data: serde_json::Value) -> Envelope {
+    let ts = now_unix_ns();
+    let payload = serde_json::json!({
+        "inventory_type": inventory_type,
+        "data": data,
+        "timestamp_unix_ns": ts,
+    });
+
+    Envelope {
+        signal_type: SignalType::Inventory,
+        payload: serde_json::to_vec(&payload).unwrap_or_default(),
+        timestamp_unix_ns: ts,
+        buffered: false,
+        retry_count: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat envelope
+// ---------------------------------------------------------------------------
+
+/// Create a heartbeat envelope.
+pub fn heartbeat_envelope(data: serde_json::Value) -> Envelope {
+    let ts = now_unix_ns();
+
+    let payload = HeartbeatPayload {
+        agent_version: data["agent_version"].as_str().unwrap_or("").to_string(),
+        uptime_seconds: data["uptime_seconds"].as_u64().unwrap_or(0),
+        config_hash: data["config_hash"].as_str().unwrap_or("").to_string(),
+        collectors_active: data["active_collectors"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        buffer_used_mb: data["buffer_used_bytes"].as_f64().unwrap_or(0.0) / 1_048_576.0,
+        send_errors_total: data["send_errors_total"].as_u64().unwrap_or(0),
+        redactions_total: data["redactions_total"].as_u64().unwrap_or(0),
+        envelopes_sent_total: data["envelopes_sent"].as_u64().unwrap_or(0),
+        cpu_usage_percent: 0.0,
+        memory_usage_mb: 0.0,
+    };
+
+    Envelope {
+        signal_type: SignalType::Heartbeat,
+        payload: payload.encode_to_vec(),
+        timestamp_unix_ns: ts,
+        buffered: false,
+        retry_count: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trace envelope (kept as JSON for now — otel worker handles raw OTLP)
 // ---------------------------------------------------------------------------
 
 /// Create a trace envelope from span data.
@@ -147,103 +355,6 @@ pub fn trace_envelope(
 }
 
 // ---------------------------------------------------------------------------
-// Event envelope
-// ---------------------------------------------------------------------------
-
-/// Create a generic event envelope.
-pub fn event_envelope(event_type: &str, summary: &str, details: serde_json::Value) -> Envelope {
-    let ts = now_unix_ns();
-    let payload = serde_json::json!({
-        "event_type": event_type,
-        "summary": summary,
-        "details": details,
-        "timestamp_unix_ns": ts,
-    });
-
-    Envelope {
-        signal_type: SignalType::Event,
-        payload: serde_json::to_vec(&payload).unwrap_or_default(),
-        timestamp_unix_ns: ts,
-        buffered: false,
-        retry_count: 0,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Security event envelope
-// ---------------------------------------------------------------------------
-
-/// Create a security event envelope.
-///
-/// `severity` should be one of: "low", "medium", "high", "critical".
-pub fn security_event_envelope(
-    event_type: &str,
-    severity: &str,
-    summary: &str,
-    details: serde_json::Value,
-) -> Envelope {
-    let ts = now_unix_ns();
-    let payload = serde_json::json!({
-        "event_type": event_type,
-        "severity": severity,
-        "summary": summary,
-        "details": details,
-        "timestamp_unix_ns": ts,
-    });
-
-    Envelope {
-        signal_type: SignalType::SecurityEvent,
-        payload: serde_json::to_vec(&payload).unwrap_or_default(),
-        timestamp_unix_ns: ts,
-        buffered: false,
-        retry_count: 0,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Inventory envelope
-// ---------------------------------------------------------------------------
-
-/// Create an inventory envelope with an arbitrary JSON payload.
-pub fn inventory_envelope(inventory_type: &str, data: serde_json::Value) -> Envelope {
-    let ts = now_unix_ns();
-    let payload = serde_json::json!({
-        "inventory_type": inventory_type,
-        "data": data,
-        "timestamp_unix_ns": ts,
-    });
-
-    Envelope {
-        signal_type: SignalType::Inventory,
-        payload: serde_json::to_vec(&payload).unwrap_or_default(),
-        timestamp_unix_ns: ts,
-        buffered: false,
-        retry_count: 0,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Heartbeat envelope
-// ---------------------------------------------------------------------------
-
-/// Create a heartbeat envelope.
-pub fn heartbeat_envelope(data: serde_json::Value) -> Envelope {
-    let ts = now_unix_ns();
-    let payload = serde_json::json!({
-        "heartbeat": data,
-        "timestamp_unix_ns": ts,
-    });
-
-    Envelope {
-        signal_type: SignalType::Heartbeat,
-        payload: serde_json::to_vec(&payload).unwrap_or_default(),
-        timestamp_unix_ns: ts,
-        buffered: false,
-        retry_count: 0,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -252,56 +363,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metric_envelope_serializes_correctly() {
+    fn metric_envelope_serializes_as_protobuf() {
         let env = metric_envelope("cpu.usage.percent", 42.5, &[("host", "h1")], "gauge");
         assert_eq!(env.signal_type, SignalType::Metric);
         assert!(!env.payload.is_empty());
-        assert!(!env.buffered);
-        assert_eq!(env.retry_count, 0);
 
-        let parsed: serde_json::Value = serde_json::from_slice(&env.payload).unwrap();
-        assert_eq!(parsed["name"], "cpu.usage.percent");
-        assert_eq!(parsed["value"], 42.5);
-        assert_eq!(parsed["metric_type"], "gauge");
+        let parsed = MetricPayload::decode(env.payload.as_slice()).unwrap();
+        assert_eq!(parsed.name, "cpu.usage.percent");
+        assert!((parsed.value - 42.5).abs() < f64::EPSILON);
+        assert_eq!(parsed.metric_type, MetricType::Gauge as i32);
+        assert_eq!(parsed.labels.get("host").unwrap(), "h1");
     }
 
     #[test]
-    fn log_envelope_includes_trace_context() {
-        let env = log_envelope(
-            "test message",
-            "INFO",
-            "/var/log/app.log",
-            &[("app", "myapp")],
-            Some("abc123"),
-            Some("def456"),
-        );
-        assert_eq!(env.signal_type, SignalType::Log);
-        let parsed: serde_json::Value = serde_json::from_slice(&env.payload).unwrap();
-        assert_eq!(parsed["trace_id"], "abc123");
-        assert_eq!(parsed["span_id"], "def456");
-    }
-
-    #[test]
-    fn security_event_envelope_has_correct_type() {
-        let env = security_event_envelope(
-            "PORT_CHANGE",
-            "medium",
-            "New port detected: 8080",
-            serde_json::json!({"port": 8080}),
-        );
-        assert_eq!(env.signal_type, SignalType::SecurityEvent);
-    }
-
-    #[test]
-    fn heartbeat_envelope_has_correct_type() {
-        let env = heartbeat_envelope(serde_json::json!({"version": "0.1.0"}));
+    fn heartbeat_envelope_serializes_as_protobuf() {
+        let env = heartbeat_envelope(serde_json::json!({
+            "agent_version": "0.1.0",
+            "uptime_seconds": 3600,
+            "active_collectors": ["cpu", "memory"],
+        }));
         assert_eq!(env.signal_type, SignalType::Heartbeat);
+
+        let parsed = HeartbeatPayload::decode(env.payload.as_slice()).unwrap();
+        assert_eq!(parsed.agent_version, "0.1.0");
+        assert_eq!(parsed.uptime_seconds, 3600);
+        assert_eq!(parsed.collectors_active, vec!["cpu", "memory"]);
     }
 
     #[test]
-    fn inventory_envelope_has_correct_type() {
-        let env = inventory_envelope("host", serde_json::json!({"hostname": "test"}));
-        assert_eq!(env.signal_type, SignalType::Inventory);
+    fn log_envelope_serializes_as_protobuf() {
+        let env = log_envelope("test msg", "INFO", "/var/log/app.log", &[("app", "myapp")], Some("abc"), Some("def"));
+        assert_eq!(env.signal_type, SignalType::Log);
+
+        let parsed = LogPayload::decode(env.payload.as_slice()).unwrap();
+        assert_eq!(parsed.message, "test msg");
+        assert_eq!(parsed.trace_id, "abc");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod grpc_client;
+pub mod proto;
 pub mod retry;
 pub mod tls;
 
