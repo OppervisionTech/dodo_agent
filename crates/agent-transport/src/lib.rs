@@ -48,6 +48,8 @@ pub struct TransportConfig {
     pub client_cert_path: String,
     pub client_key_path: String,
     pub verify_server: bool,
+    /// Optional API key from dodo_portal sent as `x-api-key` gRPC metadata header.
+    pub api_key: Option<String>,
 }
 
 impl Default for TransportConfig {
@@ -62,6 +64,7 @@ impl Default for TransportConfig {
             client_cert_path: String::new(),
             client_key_path: String::new(),
             verify_server: true,
+            api_key: None,
         }
     }
 }

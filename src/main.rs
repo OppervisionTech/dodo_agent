@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
         client_cert_path: config.tls.client_cert_path.clone(),
         client_key_path: config.tls.client_key_path.clone(),
         verify_server: config.tls.verify_server,
+        api_key: std::env::var("DODO_API_KEY").ok().filter(|k| !k.is_empty()),
     };
 
     let buffer_config = agent_transport::buffer::BufferConfig {

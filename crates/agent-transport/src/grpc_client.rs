@@ -96,7 +96,22 @@ impl GrpcClient {
         envelopes: Vec<proto::AgentEnvelope>,
     ) -> TransportResult<SubmitResult> {
         let mut client = IngestorServiceClient::new(channel);
-        let request = tonic::Request::new(proto::SubmitBatchRequest { envelopes });
+        let mut request = tonic::Request::new(proto::SubmitBatchRequest { envelopes });
+
+        // Attach API key as gRPC metadata header when configured
+        if let Some(ref key) = self.config.api_key {
+            if !key.is_empty() {
+                match tonic::metadata::MetadataValue::try_from(key.as_str()) {
+                    Ok(val) => {
+                        request.metadata_mut().insert("x-api-key", val);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to attach api_key to gRPC metadata");
+                    }
+                }
+            }
+        }
+
         let response = client.submit_batch(request).await.map_err(|e| {
             TransportError::Grpc {
                 code: e.code().to_string(),
