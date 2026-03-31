@@ -69,12 +69,38 @@ pub struct HeartbeatPayload {
     pub memory_usage_mb: f64,
 }
 
+/// LogLevel enum values matching dodo.proto.v1.LogLevel.
+/// Field 2 must be varint (i32) to match the proto definition.
+#[allow(dead_code)]
+pub mod log_level {
+    pub const UNSPECIFIED: i32 = 0;
+    pub const TRACE: i32 = 1;
+    pub const DEBUG: i32 = 2;
+    pub const INFO: i32 = 3;
+    pub const WARN: i32 = 4;
+    pub const ERROR: i32 = 5;
+    pub const FATAL: i32 = 6;
+
+    pub fn from_str(s: &str) -> i32 {
+        match s {
+            "TRACE" => TRACE,
+            "DEBUG" => DEBUG,
+            "INFO" => INFO,
+            "WARN" => WARN,
+            "ERROR" => ERROR,
+            "FATAL" => FATAL,
+            _ => UNSPECIFIED,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LogPayload {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub level: ::prost::alloc::string::String,
+    /// LogLevel enum as i32 (varint). Matches dodo.proto.v1.LogLevel field 2.
+    #[prost(int32, tag = "2")]
+    pub level: i32,
     #[prost(string, tag = "3")]
     pub source: ::prost::alloc::string::String,
     #[prost(map = "string, string", tag = "4")]
@@ -179,7 +205,7 @@ pub fn log_envelope(
 
     let payload = LogPayload {
         message: message.to_string(),
-        level: severity.to_string(),
+        level: log_level::from_str(severity),
         source: source.to_string(),
         fields,
         trace_id: trace_id.unwrap_or("").to_string(),
