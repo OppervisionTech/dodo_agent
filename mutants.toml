@@ -1,0 +1,7 @@
+# mutants.toml — cargo-mutants configuration for dodo_agent.
+# Install: cargo install cargo-mutants
+# Run: cargo mutants --workspace --package agent-core
+
+[file_filter]
+# Exclude test files and build scripts from mutation
+exclude_globs = ["**/tests/**", "**/*_test.rs", "**/build.rs"]
