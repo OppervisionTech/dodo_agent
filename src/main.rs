@@ -110,14 +110,20 @@ async fn main() -> Result<()> {
         let mut ac = agent_state
             .active_collectors
             .write()
-            .expect("lock poisoned");
+            .unwrap_or_else(|e| {
+                tracing::error!("active_collectors lock poisoned, recovering: {}", e);
+                e.into_inner()
+            });
         *ac = active_names;
     }
 
     // Set initial config hash
     {
         let hash = agent_config::loader::config_hash(&config);
-        let mut ch = agent_state.config_hash.write().expect("lock poisoned");
+        let mut ch = agent_state.config_hash.write().unwrap_or_else(|e| {
+            tracing::error!("config_hash lock poisoned, recovering: {}", e);
+            e.into_inner()
+        });
         *ch = hash;
     }
 
@@ -496,14 +502,38 @@ async fn run_transport(
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                info!("transport shutting down");
-                // Final drain attempt
-                if let Some(batch) = batch_rx.recv().await {
-                    if let Err(e) = grpc_client.submit_batch(batch, &agent_state).await {
-                        warn!(error = %e, "final batch send failed, buffering");
-                        // Buffer to disk if available
+                info!("transport shutting down, draining remaining batches");
+                // Drain ALL remaining batches from the channel
+                let mut drained = 0u64;
+                let mut failed = 0u64;
+                while let Ok(batch) = batch_rx.try_recv() {
+                    let batch_size = batch.len();
+                    match grpc_client.submit_batch(batch.clone(), &agent_state).await {
+                        Ok(result) => {
+                            drained += result.accepted as u64;
+                            agent_state.envelopes_sent.fetch_add(
+                                result.accepted as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, batch_size = batch_size, "shutdown batch send failed, buffering to disk");
+                            failed += batch_size as u64;
+                            // Buffer to disk if available
+                            if let Some(ref buf) = disk_buffer {
+                                if let Err(be) = buf.write(&batch) {
+                                    error!(error = %be, "failed to write to disk buffer during shutdown");
+                                } else {
+                                    agent_state.buffer_used_bytes.store(
+                                        buf.used_bytes(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
+                info!(drained = drained, failed = failed, "transport shutdown drain complete");
                 grpc_client.disconnect().await;
                 return;
             }
