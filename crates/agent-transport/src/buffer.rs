@@ -72,6 +72,12 @@ impl DiskBuffer {
         if current_size >= self.max_size_bytes {
             // Try to evict low-priority data
             self.evict_lowest_priority()?;
+            // Re-check after eviction — reject write if still full
+            if self.used_bytes() >= self.max_size_bytes {
+                return Err(TransportError::Buffer(
+                    "buffer full after eviction, cannot write".to_string(),
+                ));
+            }
         }
 
         let mut written = 0;
@@ -287,6 +293,6 @@ impl DiskBuffer {
             }
         }
         warn!("buffer full, could not evict enough data");
-        Ok(())
+        Err(TransportError::Buffer("eviction failed to free enough space".to_string()))
     }
 }
