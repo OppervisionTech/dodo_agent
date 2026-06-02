@@ -4,6 +4,7 @@ members = [
     "crates/agent-core",
     "crates/agent-collectors",
     "crates/agent-transport",
+    "crates/agent-command",
     "crates/agent-config",
     "crates/agent-ebpf",
     "crates/agent-platform",
@@ -58,11 +59,14 @@ proptest = "1"
 
 # HTTP (for cloud metadata, OTEL HTTP)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Async stream utilities (used by agent-command)
+tokio-stream = "0.1"
 axum = "0.7"
 
 # Database clients (feature-gated in agent-collectors)
 tokio-postgres = "0.7"
-mongodb = "2"
+mongodb = "3"
 
 # TLS
 rustls = "0.23"
@@ -76,6 +80,7 @@ x509-parser = "0.16"
 agent-core = { path = "crates/agent-core" }
 agent-collectors = { path = "crates/agent-collectors" }
 agent-transport = { path = "crates/agent-transport" }
+agent-command = { path = "crates/agent-command" }
 agent-config = { path = "crates/agent-config" }
 agent-ebpf = { path = "crates/agent-ebpf" }
 agent-platform = { path = "crates/agent-platform" }
@@ -125,6 +130,7 @@ lite = [
 agent-core = { workspace = true }
 agent-collectors = { workspace = true }
 agent-transport = { workspace = true }
+agent-command = { workspace = true }
 agent-config = { workspace = true }
 agent-ebpf = { workspace = true, optional = true }
 agent-platform = { workspace = true }

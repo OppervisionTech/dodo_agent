@@ -179,6 +179,15 @@ async fn main() -> Result<()> {
         drain_rate_per_second: 1,
     };
 
+    // Spawn command channel (bidirectional gRPC stream for receiving platform commands)
+    let cmd_transport_config = transport_config.clone();
+    let cmd_agent_id = agent_state.agent_id.clone();
+    let cmd_cancel = cancel_token.clone();
+    let command_channel_handle = tokio::spawn(async move {
+        let channel = agent_command::CommandChannel::new(cmd_agent_id, cmd_transport_config);
+        channel.run(cmd_cancel).await;
+    });
+
     let transport_token = cancel_token.clone();
     let transport_state = agent_state.clone();
     let transport_handle = tokio::spawn(async move {
@@ -249,6 +258,10 @@ async fn main() -> Result<()> {
         // Wait for transport to finish sending
         let _ = transport_handle.await;
         info!("transport stopped");
+
+        // Wait for command channel
+        let _ = command_channel_handle.await;
+        info!("command channel stopped");
 
         // Wait for config watcher
         let _ = config_watcher_handle.await;

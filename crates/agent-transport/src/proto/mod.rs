@@ -112,3 +112,164 @@ pub mod ingestor_service_client {
 }
 
 pub use ingestor_service_client::IngestorServiceClient;
+
+// ---------------------------------------------------------------------------
+// AgentCommand / AgentCommandResult — bidirectional command channel
+// ---------------------------------------------------------------------------
+
+/// Command payload variants that the platform can send to an agent.
+#[derive(Clone, PartialEq, ::prost::Oneof)]
+pub enum AgentCommandPayload {
+    #[prost(message, tag = "10")]
+    RestartPod(RestartPodCmd),
+    #[prost(message, tag = "11")]
+    ScaleDeployment(ScaleDeploymentCmd),
+    #[prost(message, tag = "12")]
+    ExecInContainer(ExecInContainerCmd),
+    #[prost(message, tag = "13")]
+    GetPodLogs(GetPodLogsCmd),
+    #[prost(message, tag = "14")]
+    ApplyManifest(ApplyManifestCmd),
+    #[prost(message, tag = "15")]
+    Rollback(RollbackDeploymentCmd),
+    #[prost(message, tag = "16")]
+    DescribeResource(DescribeResourceCmd),
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentCommand {
+    #[prost(string, tag = "1")]
+    pub command_id: String,
+    #[prost(string, tag = "2")]
+    pub agent_id: String,
+    #[prost(string, tag = "3")]
+    pub issued_by: String,
+    #[prost(int32, tag = "4")]
+    pub timeout_s: i32,
+    #[prost(oneof = "AgentCommandPayload", tags = "10, 11, 12, 13, 14, 15, 16")]
+    pub payload: Option<AgentCommandPayload>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RestartPodCmd {
+    #[prost(string, tag = "1")]
+    pub namespace: String,
+    #[prost(string, tag = "2")]
+    pub pod_name: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScaleDeploymentCmd {
+    #[prost(string, tag = "1")]
+    pub namespace: String,
+    #[prost(string, tag = "2")]
+    pub deployment: String,
+    #[prost(int32, tag = "3")]
+    pub replicas: i32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExecInContainerCmd {
+    #[prost(string, tag = "1")]
+    pub namespace: String,
+    #[prost(string, tag = "2")]
+    pub pod: String,
+    #[prost(string, tag = "3")]
+    pub container: String,
+    #[prost(string, repeated, tag = "4")]
+    pub command: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetPodLogsCmd {
+    #[prost(string, tag = "1")]
+    pub namespace: String,
+    #[prost(string, tag = "2")]
+    pub pod: String,
+    #[prost(int32, tag = "3")]
+    pub tail_lines: i32,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ApplyManifestCmd {
+    #[prost(string, tag = "1")]
+    pub manifest_yaml_b64: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RollbackDeploymentCmd {
+    #[prost(string, tag = "1")]
+    pub namespace: String,
+    #[prost(string, tag = "2")]
+    pub deployment: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DescribeResourceCmd {
+    #[prost(string, tag = "1")]
+    pub kind: String,
+    #[prost(string, tag = "2")]
+    pub namespace: String,
+    #[prost(string, tag = "3")]
+    pub name: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentCommandResult {
+    #[prost(string, tag = "1")]
+    pub command_id: String,
+    #[prost(string, tag = "2")]
+    pub agent_id: String,
+    #[prost(bool, tag = "3")]
+    pub success: bool,
+    #[prost(string, tag = "4")]
+    pub output: String,
+    #[prost(string, tag = "5")]
+    pub error: String,
+}
+
+/// Minimal tonic gRPC client for CommandService.
+pub mod command_service_client {
+    use super::{AgentCommand, AgentCommandResult};
+
+    #[derive(Clone)]
+    pub struct CommandServiceClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+
+    impl CommandServiceClient<tonic::transport::Channel> {
+        pub fn new(channel: tonic::transport::Channel) -> Self {
+            let inner = tonic::client::Grpc::new(channel);
+            Self { inner }
+        }
+    }
+
+    impl<T> CommandServiceClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::BoxBody>,
+        T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+        <T::ResponseBody as tonic::codegen::Body>::Error:
+            Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+    {
+        /// Open a bidirectional stream for agent command dispatch.
+        /// The agent sends AgentCommandResult; the server sends AgentCommand.
+        pub async fn command_stream(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = AgentCommandResult>,
+        ) -> Result<tonic::Response<tonic::codec::Streaming<AgentCommand>>, tonic::Status> {
+            self.inner.ready().await.map_err(|_| {
+                tonic::Status::new(tonic::Code::Unknown, "service not ready")
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/dodo.proto.v1.CommandService/CommandStream",
+            );
+            self.inner
+                .streaming(request.into_streaming_request(), path, codec)
+                .await
+        }
+    }
+}
+
+pub use command_service_client::CommandServiceClient;
