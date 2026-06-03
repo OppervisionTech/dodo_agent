@@ -108,7 +108,7 @@ impl MongodbCollector {
         let db = client.database("admin");
         let cmd = mongodb::bson::doc! { "serverStatus": 1 };
 
-        let status = match db.run_command(cmd, None).await {
+        let status = match db.run_command(cmd).await {
             Ok(doc) => doc,
             Err(e) => {
                 warn!(error = %e, "MongoDB serverStatus failed");
