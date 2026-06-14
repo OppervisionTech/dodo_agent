@@ -16,6 +16,32 @@ use tokio::sync::Mutex;
 
 use crate::helpers::log_envelope;
 
+/// Expand a list of paths (which may include glob patterns) to concrete file paths.
+/// Glob patterns use the standard `*`, `?`, `[abc]` syntax.
+/// Non-glob paths are included as-is (missing files are silently skipped at read time).
+fn expand_paths(paths: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    for path in paths {
+        if path.contains('*') || path.contains('?') || path.contains('[') {
+            match glob::glob(path) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if let Some(s) = entry.to_str() {
+                            result.push(s.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(pattern = %path, error = %e, "invalid glob pattern, skipping");
+                }
+            }
+        } else {
+            result.push(path.clone());
+        }
+    }
+    result
+}
+
 /// Maximum line length before truncation (16 KB).
 const MAX_LINE_LENGTH: usize = 16 * 1024;
 
@@ -42,8 +68,8 @@ enum LogFormat {
 /// Tails log files and produces Log envelopes with format auto-detection.
 pub struct LogsCollector {
     platform: Arc<dyn Platform>,
-    /// Paths to log files to tail.
-    log_paths: Vec<String>,
+    /// Raw path patterns (may include globs like `/host/var/log/containers/*.log`).
+    log_path_patterns: Vec<String>,
     /// Per-file offset state for tailing.
     file_states: Mutex<HashMap<String, FileState>>,
     /// Maximum lines per collection interval.
@@ -53,7 +79,7 @@ pub struct LogsCollector {
 impl LogsCollector {
     /// Create a new log collector.
     ///
-    /// - `log_paths`: Paths to log files to tail.
+    /// - `log_paths`: Paths or glob patterns to tail.
     /// - `max_lines_per_sec`: Rate limit. Defaults to 10,000 if `None`.
     pub fn new(
         platform: Arc<dyn Platform>,
@@ -62,7 +88,7 @@ impl LogsCollector {
     ) -> Self {
         Self {
             platform,
-            log_paths,
+            log_path_patterns: log_paths,
             file_states: Mutex::new(HashMap::new()),
             max_lines_per_sec: max_lines_per_sec.unwrap_or(DEFAULT_MAX_LINES_PER_SEC),
         }
@@ -218,7 +244,10 @@ impl Collector for LogsCollector {
             let mut total_lines: usize = 0;
             let mut states = self.file_states.lock().await;
 
-            for path in &self.log_paths {
+            // Re-expand glob patterns each cycle to pick up new log files
+            let resolved_paths = expand_paths(&self.log_path_patterns);
+
+            for path in &resolved_paths {
                 // Read the full file content via platform abstraction.
                 // In production this would use seek + read from offset.
                 // For MVP, we read the full file and track offset.

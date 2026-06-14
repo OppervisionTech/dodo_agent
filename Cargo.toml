@@ -76,6 +76,9 @@ tokio-rustls = "0.26"
 # X.509
 x509-parser = "0.16"
 
+# Glob pattern matching (for log file discovery)
+glob = "0.3"
+
 # Internal crates
 agent-core = { path = "crates/agent-core" }
 agent-collectors = { path = "crates/agent-collectors" }
