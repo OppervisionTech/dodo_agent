@@ -72,8 +72,14 @@ fn security_sql_injection_in_value() {
     let input = "password=';DROP-TABLE-users;--";
     let result = engine.redact(input);
     // The SQL injection string must be redacted (the whole non-whitespace token)
-    assert!(result.contains("***"), "SQL injection in password value must be redacted");
-    assert!(!result.contains("DROP-TABLE"), "SQL injection must not appear in output");
+    assert!(
+        result.contains("***"),
+        "SQL injection in password value must be redacted"
+    );
+    assert!(
+        !result.contains("DROP-TABLE"),
+        "SQL injection must not appear in output"
+    );
 }
 
 /// Test that path traversal in custom patterns doesn't break the engine

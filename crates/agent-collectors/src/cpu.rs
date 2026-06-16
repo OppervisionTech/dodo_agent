@@ -231,7 +231,20 @@ impl Collector for CpuCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::MetricPayload;
     use agent_platform::common::MockPlatform;
+    use prost::Message;
+
+    fn metric_names(envelopes: &[Envelope]) -> Vec<String> {
+        envelopes
+            .iter()
+            .filter_map(|e| {
+                MetricPayload::decode(e.payload.as_slice())
+                    .ok()
+                    .map(|p| p.name)
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn first_collection_returns_load_and_counts() {
@@ -245,14 +258,7 @@ mod tests {
         // First collection: no deltas, but should have load avg + cpu counts
         assert!(!envelopes.is_empty());
 
-        let names: Vec<String> = envelopes
-            .iter()
-            .filter_map(|e| {
-                let v: serde_json::Value = serde_json::from_slice(&e.payload).ok()?;
-                v["name"].as_str().map(|s| s.to_string())
-            })
-            .collect();
-
+        let names = metric_names(&envelopes);
         assert!(names.contains(&"cpu.load.1m".to_string()));
         assert!(names.contains(&"cpu.count.logical".to_string()));
     }
@@ -270,14 +276,7 @@ mod tests {
         assert!(result.is_ok());
         let envelopes = result.unwrap();
 
-        let names: Vec<String> = envelopes
-            .iter()
-            .filter_map(|e| {
-                let v: serde_json::Value = serde_json::from_slice(&e.payload).ok()?;
-                v["name"].as_str().map(|s| s.to_string())
-            })
-            .collect();
-
+        let names = metric_names(&envelopes);
         assert!(names.contains(&"cpu.load.1m".to_string()));
         assert!(names.contains(&"cpu.count.logical".to_string()));
     }

@@ -293,6 +293,8 @@ impl DiskBuffer {
             }
         }
         warn!("buffer full, could not evict enough data");
-        Err(TransportError::Buffer("eviction failed to free enough space".to_string()))
+        Err(TransportError::Buffer(
+            "eviction failed to free enough space".to_string(),
+        ))
     }
 }

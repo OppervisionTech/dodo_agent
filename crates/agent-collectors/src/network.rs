@@ -176,7 +176,20 @@ impl Collector for NetworkCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::MetricPayload;
     use agent_platform::common::MockPlatform;
+    use prost::Message;
+
+    fn metric_names(envelopes: &[Envelope]) -> Vec<String> {
+        envelopes
+            .iter()
+            .filter_map(|e| {
+                MetricPayload::decode(e.payload.as_slice())
+                    .ok()
+                    .map(|p| p.name)
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn first_collection_has_tcp_metrics() {
@@ -184,15 +197,7 @@ mod tests {
         let collector = NetworkCollector::new(platform);
 
         let envelopes = collector.collect().await.unwrap();
-
-        let names: Vec<String> = envelopes
-            .iter()
-            .filter_map(|e| {
-                let v: serde_json::Value = serde_json::from_slice(&e.payload).ok()?;
-                v["name"].as_str().map(|s| s.to_string())
-            })
-            .collect();
-
+        let names = metric_names(&envelopes);
         assert!(names.contains(&"network.tcp.established".to_string()));
         assert!(names.contains(&"network.tcp.total".to_string()));
     }
@@ -204,15 +209,7 @@ mod tests {
 
         let _ = collector.collect().await;
         let envelopes = collector.collect().await.unwrap();
-
-        let names: Vec<String> = envelopes
-            .iter()
-            .filter_map(|e| {
-                let v: serde_json::Value = serde_json::from_slice(&e.payload).ok()?;
-                v["name"].as_str().map(|s| s.to_string())
-            })
-            .collect();
-
+        let names = metric_names(&envelopes);
         assert!(names.contains(&"network.bytes.recv".to_string()));
         assert!(names.contains(&"network.bytes.sent".to_string()));
     }

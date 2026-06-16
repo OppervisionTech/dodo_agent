@@ -261,9 +261,10 @@ impl MongodbCollector {
                         .get_i64("ts")
                         .ok()
                         .and_then(|my_ts| {
-                            primary_time.get_i64("ts").ok().map(|p_ts| {
-                                (p_ts.saturating_sub(my_ts)).max(0) as f64
-                            })
+                            primary_time
+                                .get_i64("ts")
+                                .ok()
+                                .map(|p_ts| (p_ts.saturating_sub(my_ts)).max(0) as f64)
                         })
                         .unwrap_or(0.0);
 

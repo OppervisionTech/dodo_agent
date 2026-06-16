@@ -16,7 +16,7 @@ use std::time::Duration;
 use agent_core::{Collector, CollectorError, Envelope, SignalType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::helpers;
 
@@ -38,6 +38,7 @@ struct ContainerListEntry {
     #[serde(rename = "State")]
     state: String,
     #[serde(rename = "Status")]
+    #[allow(dead_code)]
     status: String,
 }
 
@@ -196,9 +197,7 @@ fn decode_chunked(data: &[u8]) -> Vec<u8> {
 }
 
 async fn docker_available() -> bool {
-    tokio::net::UnixStream::connect(DOCKER_SOCKET)
-        .await
-        .is_ok()
+    tokio::net::UnixStream::connect(DOCKER_SOCKET).await.is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -291,15 +290,12 @@ impl DockerCollector {
                                     .cpu_stats
                                     .cpu_usage
                                     .total_usage
-                                    .saturating_sub(
-                                        stats.precpu_stats.cpu_usage.total_usage,
-                                    );
+                                    .saturating_sub(stats.precpu_stats.cpu_usage.total_usage);
                                 let system_delta = stats
                                     .cpu_stats
                                     .system_cpu_usage
                                     .saturating_sub(stats.precpu_stats.system_cpu_usage);
-                                let num_cpus =
-                                    stats.cpu_stats.online_cpus.max(1);
+                                let num_cpus = stats.cpu_stats.online_cpus.max(1);
                                 let cpu_percent = if system_delta > 0 {
                                     (cpu_delta as f64 / system_delta as f64)
                                         * num_cpus as f64
@@ -373,17 +369,11 @@ impl DockerCollector {
 
                                 // Compute deltas
                                 let mut prev_guard = self.previous.lock().await;
-                                if let Some(prev) =
-                                    prev_guard.get(&short_id.to_string())
-                                {
-                                    let rx_delta =
-                                        total_rx.saturating_sub(prev.rx_bytes);
-                                    let tx_delta =
-                                        total_tx.saturating_sub(prev.tx_bytes);
-                                    let read_delta =
-                                        read_bytes.saturating_sub(prev.read_bytes);
-                                    let write_delta =
-                                        write_bytes.saturating_sub(prev.write_bytes);
+                                if let Some(prev) = prev_guard.get(&short_id.to_string()) {
+                                    let rx_delta = total_rx.saturating_sub(prev.rx_bytes);
+                                    let tx_delta = total_tx.saturating_sub(prev.tx_bytes);
+                                    let read_delta = read_bytes.saturating_sub(prev.read_bytes);
+                                    let write_delta = write_bytes.saturating_sub(prev.write_bytes);
 
                                     envelopes.push(helpers::metric_envelope(
                                         "docker.container.network.rx_bytes",
@@ -435,9 +425,7 @@ impl DockerCollector {
                 // Restart count (from inspect)
                 let inspect_path = format!("/containers/{}/json", container.id);
                 if let Ok(inspect_body) = docker_get(&inspect_path).await {
-                    if let Ok(inspect) =
-                        serde_json::from_slice::<ContainerInspect>(&inspect_body)
-                    {
+                    if let Ok(inspect) = serde_json::from_slice::<ContainerInspect>(&inspect_body) {
                         envelopes.push(helpers::metric_envelope(
                             "docker.container.restart_count",
                             inspect.restart_count as f64,
@@ -555,8 +543,7 @@ mod tests {
         let cpu_delta = 500_000_000u64;
         let system_delta = 10_000_000_000u64;
         let num_cpus = 4u64;
-        let percent =
-            (cpu_delta as f64 / system_delta as f64) * num_cpus as f64 * 100.0;
+        let percent = (cpu_delta as f64 / system_delta as f64) * num_cpus as f64 * 100.0;
         assert!((percent - 20.0).abs() < 0.01);
     }
 

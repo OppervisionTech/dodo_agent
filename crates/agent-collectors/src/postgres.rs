@@ -8,7 +8,6 @@
 //! - Requires `pg_monitor` role (read-only)
 //! - Only SELECT queries on statistics views
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;

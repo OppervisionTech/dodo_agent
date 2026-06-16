@@ -337,6 +337,7 @@ pub fn heartbeat_envelope(data: serde_json::Value) -> Envelope {
 // ---------------------------------------------------------------------------
 
 /// Create a trace envelope from span data.
+#[allow(clippy::too_many_arguments)]
 pub fn trace_envelope(
     trace_id: &str,
     span_id: &str,
@@ -418,7 +419,14 @@ mod tests {
 
     #[test]
     fn log_envelope_serializes_as_protobuf() {
-        let env = log_envelope("test msg", "INFO", "/var/log/app.log", &[("app", "myapp")], Some("abc"), Some("def"));
+        let env = log_envelope(
+            "test msg",
+            "INFO",
+            "/var/log/app.log",
+            &[("app", "myapp")],
+            Some("abc"),
+            Some("def"),
+        );
         assert_eq!(env.signal_type, SignalType::Log);
 
         let parsed = LogPayload::decode(env.payload.as_slice()).unwrap();

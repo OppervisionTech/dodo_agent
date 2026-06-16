@@ -17,10 +17,18 @@ fn integration_env_var_scrubbing_common_patterns() {
         ("PASSWD=mysecret", false, "mysecret"),
         // Tokens / Keys
         ("api_key=sk-abcdefghijklmnop", false, "sk-abcdefghijklmnop"),
-        ("API_KEY=AKIAIOSFODNN7EXAMPLE", false, "AKIAIOSFODNN7EXAMPLE"),
+        (
+            "API_KEY=AKIAIOSFODNN7EXAMPLE",
+            false,
+            "AKIAIOSFODNN7EXAMPLE",
+        ),
         ("access_key=ASIA1234567890ABCDE", false, "1234567890"),
         ("secret=super-secret-value", false, "super-secret-value"),
-        ("token=eyJhbGciOiJIUzI1NiJ9.test", false, "eyJhbGciOiJIUzI1NiJ9"),
+        (
+            "token=eyJhbGciOiJIUzI1NiJ9.test",
+            false,
+            "eyJhbGciOiJIUzI1NiJ9",
+        ),
         // Non-sensitive (must NOT be redacted)
         ("PATH=/usr/bin:/usr/local/bin", true, ""),
         ("HOME=/home/agent", true, ""),
@@ -104,8 +112,14 @@ fn integration_custom_pattern_corporate_secret() {
 
     let input = "CORP_API_SECRET=corp-secret-xyz INTERNAL_KEY=key-abc";
     let result = engine.redact(input);
-    assert!(!result.contains("corp-secret-xyz"), "Custom pattern 1 must be redacted");
-    assert!(!result.contains("key-abc"), "Custom pattern 2 must be redacted");
+    assert!(
+        !result.contains("corp-secret-xyz"),
+        "Custom pattern 1 must be redacted"
+    );
+    assert!(
+        !result.contains("key-abc"),
+        "Custom pattern 2 must be redacted"
+    );
 }
 
 #[test]

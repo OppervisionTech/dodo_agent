@@ -112,12 +112,13 @@ impl GrpcClient {
             }
         }
 
-        let response = client.submit_batch(request).await.map_err(|e| {
-            TransportError::Grpc {
+        let response = client
+            .submit_batch(request)
+            .await
+            .map_err(|e| TransportError::Grpc {
                 code: e.code().to_string(),
                 message: e.message().to_string(),
-            }
-        })?;
+            })?;
         let resp = response.into_inner();
         Ok(SubmitResult {
             accepted: resp.accepted,
@@ -149,7 +150,9 @@ impl GrpcClient {
                     agent_core::SignalType::Event => proto::SignalType::Event as i32,
                     agent_core::SignalType::Inventory => proto::SignalType::Inventory as i32,
                     agent_core::SignalType::Heartbeat => proto::SignalType::Heartbeat as i32,
-                    agent_core::SignalType::SecurityEvent => proto::SignalType::SecurityEvent as i32,
+                    agent_core::SignalType::SecurityEvent => {
+                        proto::SignalType::SecurityEvent as i32
+                    }
                     agent_core::SignalType::CustomEvent => proto::SignalType::CustomEvent as i32,
                 },
                 payload: env.payload.clone(),

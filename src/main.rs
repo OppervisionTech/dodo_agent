@@ -107,13 +107,10 @@ async fn main() -> Result<()> {
 
     // Update agent state with active collectors
     {
-        let mut ac = agent_state
-            .active_collectors
-            .write()
-            .unwrap_or_else(|e| {
-                tracing::error!("active_collectors lock poisoned, recovering: {}", e);
-                e.into_inner()
-            });
+        let mut ac = agent_state.active_collectors.write().unwrap_or_else(|e| {
+            tracing::error!("active_collectors lock poisoned, recovering: {}", e);
+            e.into_inner()
+        });
         *ac = active_names;
     }
 
@@ -417,13 +414,8 @@ fn register_collectors(
                 )));
             }
             "otel" => {
-                let rate_limit = cc
-                    .parameters
-                    .get("rate_limit")
-                    .and_then(|s| s.parse().ok());
-                registry.register(Box::new(agent_collectors::OtelCollector::new(
-                    rate_limit,
-                )));
+                let rate_limit = cc.parameters.get("rate_limit").and_then(|s| s.parse().ok());
+                registry.register(Box::new(agent_collectors::OtelCollector::new(rate_limit)));
             }
             "kubernetes" => {
                 registry.register(Box::new(agent_collectors::KubernetesCollector::new(

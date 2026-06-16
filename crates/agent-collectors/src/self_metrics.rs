@@ -240,7 +240,9 @@ impl Collector for SelfMetricsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::MetricPayload;
     use agent_platform::common::MockPlatform;
+    use prost::Message;
 
     fn test_state() -> Arc<AgentState> {
         Arc::new(AgentState::new(
@@ -265,8 +267,9 @@ mod tests {
         let names: Vec<String> = envelopes
             .iter()
             .filter_map(|e| {
-                let v: serde_json::Value = serde_json::from_slice(&e.payload).ok()?;
-                v["name"].as_str().map(|s| s.to_string())
+                MetricPayload::decode(e.payload.as_slice())
+                    .ok()
+                    .map(|p| p.name)
             })
             .collect();
 

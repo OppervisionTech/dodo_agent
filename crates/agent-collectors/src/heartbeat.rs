@@ -90,6 +90,8 @@ impl Collector for HeartbeatCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::HeartbeatPayload;
+    use prost::Message;
 
     fn test_state() -> Arc<AgentState> {
         Arc::new(AgentState::new(
@@ -113,16 +115,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_contains_agent_id() {
+    async fn heartbeat_contains_agent_version() {
         let state = test_state();
         let collector = HeartbeatCollector::new(state);
 
         let envelopes = collector.collect().await.unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&envelopes[0].payload).unwrap();
-        assert_eq!(
-            payload["heartbeat"]["agent_id"].as_str(),
-            Some("test-agent-id")
-        );
+        let payload = HeartbeatPayload::decode(envelopes[0].payload.as_slice()).unwrap();
+        assert_eq!(payload.agent_version, "0.1.0");
     }
 
     #[test]

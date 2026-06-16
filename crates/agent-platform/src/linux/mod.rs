@@ -1107,7 +1107,7 @@ impl Platform for LinuxPlatform {
             Err(_) => return Ok(None), // cgroup v2 not available
         };
 
-        let fields: Vec<&str> = cpu_max.trim().split_whitespace().collect();
+        let fields: Vec<&str> = cpu_max.split_whitespace().collect();
         if fields.len() < 2 {
             return Ok(None);
         }

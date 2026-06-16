@@ -18,7 +18,7 @@ use std::time::Duration;
 use agent_core::{Collector, CollectorError, Envelope, SignalType};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::helpers;
 
@@ -56,6 +56,7 @@ pub(crate) mod otlp {
 
     pub mod any_value {
         #[derive(Clone, prost::Oneof)]
+        #[allow(clippy::enum_variant_names)]
         pub enum Value {
             #[prost(string, tag = "1")]
             StringValue(String),
@@ -536,10 +537,11 @@ fn convert_metrics(req: &otlp::ExportMetricsServiceRequest) -> Vec<Envelope> {
                 match &metric.data {
                     Some(otlp::metric::Data::Gauge(gauge)) => {
                         for dp in &gauge.data_points {
-                            let (value, labels) =
-                                extract_number_dp(dp, &service_name);
-                            let label_refs: Vec<(&str, &str)> =
-                                labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                            let (value, labels) = extract_number_dp(dp, &service_name);
+                            let label_refs: Vec<(&str, &str)> = labels
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v.as_str()))
+                                .collect();
                             envelopes.push(helpers::metric_envelope(
                                 metric_name,
                                 value,
@@ -551,25 +553,28 @@ fn convert_metrics(req: &otlp::ExportMetricsServiceRequest) -> Vec<Envelope> {
                     Some(otlp::metric::Data::Sum(sum)) => {
                         let mtype = if sum.is_monotonic { "counter" } else { "gauge" };
                         for dp in &sum.data_points {
-                            let (value, labels) =
-                                extract_number_dp(dp, &service_name);
-                            let label_refs: Vec<(&str, &str)> =
-                                labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                            let (value, labels) = extract_number_dp(dp, &service_name);
+                            let label_refs: Vec<(&str, &str)> = labels
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v.as_str()))
+                                .collect();
                             envelopes.push(helpers::metric_envelope(
-                                metric_name, value, &label_refs, mtype,
+                                metric_name,
+                                value,
+                                &label_refs,
+                                mtype,
                             ));
                         }
                     }
                     Some(otlp::metric::Data::Histogram(hist)) => {
                         for dp in &hist.data_points {
-                            let mut labels: Vec<(String, String)> = dp
-                                .attributes
-                                .iter()
-                                .filter_map(kv_to_string_pair)
-                                .collect();
+                            let mut labels: Vec<(String, String)> =
+                                dp.attributes.iter().filter_map(kv_to_string_pair).collect();
                             labels.push(("service.name".to_string(), service_name.clone()));
-                            let label_refs: Vec<(&str, &str)> =
-                                labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                            let label_refs: Vec<(&str, &str)> = labels
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v.as_str()))
+                                .collect();
                             if let Some(sum) = dp.sum {
                                 envelopes.push(helpers::metric_envelope(
                                     &format!("{metric_name}.sum"),
@@ -634,8 +639,10 @@ fn convert_logs(req: &otlp::ExportLogsServiceRequest) -> Vec<Envelope> {
                     .filter_map(kv_to_string_pair)
                     .collect();
                 attrs.push(("service.name".to_string(), service_name.clone()));
-                let attr_refs: Vec<(&str, &str)> =
-                    attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let attr_refs: Vec<(&str, &str)> = attrs
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
 
                 envelopes.push(helpers::log_envelope(
                     &body,
@@ -660,11 +667,8 @@ fn extract_number_dp(
         Some(otlp::number_data_point::Value::AsInt(i)) => *i as f64,
         None => 0.0,
     };
-    let mut labels: Vec<(String, String)> = dp
-        .attributes
-        .iter()
-        .filter_map(kv_to_string_pair)
-        .collect();
+    let mut labels: Vec<(String, String)> =
+        dp.attributes.iter().filter_map(kv_to_string_pair).collect();
     labels.push(("service.name".to_string(), service_name.to_string()));
     (value, labels)
 }
@@ -769,19 +773,16 @@ mod grpc_server {
         let io = TokioIo::new(stream);
         let handler = handler.clone();
 
-        let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-            let handler = handler.clone();
-            async move {
-                handler.handle_request(req).await
-            }
-        });
+        let service =
+            hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let handler = handler.clone();
+                async move { handler.handle_request(req).await }
+            });
 
-        let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .http2_only();
-        builder
-            .serve_connection(io, service)
-            .into_owned()
-            .await?;
+        let builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .http2_only();
+        builder.serve_connection(io, service).into_owned().await?;
 
         Ok(())
     }
@@ -790,7 +791,10 @@ mod grpc_server {
         async fn handle_request(
             &self,
             req: hyper::Request<hyper::body::Incoming>,
-        ) -> Result<hyper::Response<http_body_util::Full<hyper::body::Bytes>>, std::convert::Infallible> {
+        ) -> Result<
+            hyper::Response<http_body_util::Full<hyper::body::Bytes>>,
+            std::convert::Infallible,
+        > {
             use http_body_util::BodyExt;
 
             let path = req.uri().path().to_string();
@@ -800,16 +804,26 @@ mod grpc_server {
             };
 
             // Strip gRPC frame header (5 bytes: 1 byte compress flag + 4 bytes length)
-            let payload = if body.len() > 5 { &body[5..] } else { &body[..] };
+            let payload = if body.len() > 5 {
+                &body[5..]
+            } else {
+                &body[..]
+            };
 
             let (response_bytes, status_code) = match path.as_str() {
                 "/opentelemetry.proto.collector.trace.v1.TraceService/Export" => {
-                    self.shared.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+                    self.shared
+                        .metrics
+                        .requests_total
+                        .fetch_add(1, Ordering::Relaxed);
                     match otlp::ExportTraceServiceRequest::decode(payload) {
                         Ok(req) => {
                             let envelopes = convert_traces(&req);
                             let count = envelopes.len();
-                            self.shared.metrics.spans_received.fetch_add(count as u64, Ordering::Relaxed);
+                            self.shared
+                                .metrics
+                                .spans_received
+                                .fetch_add(count as u64, Ordering::Relaxed);
                             self.shared.try_send(envelopes);
                             let resp = otlp::ExportTraceServiceResponse::default();
                             (resp.encode_to_vec(), 0)
@@ -821,12 +835,18 @@ mod grpc_server {
                     }
                 }
                 "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export" => {
-                    self.shared.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+                    self.shared
+                        .metrics
+                        .requests_total
+                        .fetch_add(1, Ordering::Relaxed);
                     match otlp::ExportMetricsServiceRequest::decode(payload) {
                         Ok(req) => {
                             let envelopes = convert_metrics(&req);
                             let count = envelopes.len();
-                            self.shared.metrics.metrics_received.fetch_add(count as u64, Ordering::Relaxed);
+                            self.shared
+                                .metrics
+                                .metrics_received
+                                .fetch_add(count as u64, Ordering::Relaxed);
                             self.shared.try_send(envelopes);
                             let resp = otlp::ExportMetricsServiceResponse::default();
                             (resp.encode_to_vec(), 0)
@@ -838,12 +858,18 @@ mod grpc_server {
                     }
                 }
                 "/opentelemetry.proto.collector.logs.v1.LogsService/Export" => {
-                    self.shared.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+                    self.shared
+                        .metrics
+                        .requests_total
+                        .fetch_add(1, Ordering::Relaxed);
                     match otlp::ExportLogsServiceRequest::decode(payload) {
                         Ok(req) => {
                             let envelopes = convert_logs(&req);
                             let count = envelopes.len();
-                            self.shared.metrics.logs_received.fetch_add(count as u64, Ordering::Relaxed);
+                            self.shared
+                                .metrics
+                                .logs_received
+                                .fetch_add(count as u64, Ordering::Relaxed);
                             self.shared.try_send(envelopes);
                             let resp = otlp::ExportLogsServiceResponse::default();
                             (resp.encode_to_vec(), 0)
@@ -920,7 +946,10 @@ mod http_server {
         headers: axum::http::HeaderMap,
         body: axum::body::Bytes,
     ) -> axum::response::Response {
-        shared.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        shared
+            .metrics
+            .requests_total
+            .fetch_add(1, Ordering::Relaxed);
         let is_proto = is_protobuf(&headers);
 
         let req = if is_proto {
@@ -929,23 +958,22 @@ mod http_server {
             // JSON: try to decode via serde then re-encode to proto
             // For simplicity, attempt protobuf decode of JSON content too
             // (real OTLP/JSON would need proper JSON→proto mapping)
-            serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|_| None)
-                .ok_or_else(|| prost::DecodeError::new("json not yet supported as protobuf"))
+            Err(prost::DecodeError::new(
+                "json not yet supported as protobuf",
+            ))
         };
 
         match req {
             Ok(req) => {
                 let envelopes = convert_traces(&req);
                 let count = envelopes.len();
-                shared.metrics.spans_received.fetch_add(count as u64, Ordering::Relaxed);
+                shared
+                    .metrics
+                    .spans_received
+                    .fetch_add(count as u64, Ordering::Relaxed);
 
                 if shared.envelope_tx.capacity() == 0 {
-                    return (
-                        axum::http::StatusCode::TOO_MANY_REQUESTS,
-                        "buffer full",
-                    )
+                    return (axum::http::StatusCode::TOO_MANY_REQUESTS, "buffer full")
                         .into_response();
                 }
 
@@ -964,26 +992,31 @@ mod http_server {
         headers: axum::http::HeaderMap,
         body: axum::body::Bytes,
     ) -> axum::response::Response {
-        shared.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        shared
+            .metrics
+            .requests_total
+            .fetch_add(1, Ordering::Relaxed);
         let is_proto = is_protobuf(&headers);
 
         let req = if is_proto {
             otlp::ExportMetricsServiceRequest::decode(&body[..])
         } else {
-            Err(prost::DecodeError::new("json not yet supported as protobuf"))
+            Err(prost::DecodeError::new(
+                "json not yet supported as protobuf",
+            ))
         };
 
         match req {
             Ok(req) => {
                 let envelopes = convert_metrics(&req);
                 let count = envelopes.len();
-                shared.metrics.metrics_received.fetch_add(count as u64, Ordering::Relaxed);
+                shared
+                    .metrics
+                    .metrics_received
+                    .fetch_add(count as u64, Ordering::Relaxed);
 
                 if shared.envelope_tx.capacity() == 0 {
-                    return (
-                        axum::http::StatusCode::TOO_MANY_REQUESTS,
-                        "buffer full",
-                    )
+                    return (axum::http::StatusCode::TOO_MANY_REQUESTS, "buffer full")
                         .into_response();
                 }
 
@@ -1002,26 +1035,31 @@ mod http_server {
         headers: axum::http::HeaderMap,
         body: axum::body::Bytes,
     ) -> axum::response::Response {
-        shared.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        shared
+            .metrics
+            .requests_total
+            .fetch_add(1, Ordering::Relaxed);
         let is_proto = is_protobuf(&headers);
 
         let req = if is_proto {
             otlp::ExportLogsServiceRequest::decode(&body[..])
         } else {
-            Err(prost::DecodeError::new("json not yet supported as protobuf"))
+            Err(prost::DecodeError::new(
+                "json not yet supported as protobuf",
+            ))
         };
 
         match req {
             Ok(req) => {
                 let envelopes = convert_logs(&req);
                 let count = envelopes.len();
-                shared.metrics.logs_received.fetch_add(count as u64, Ordering::Relaxed);
+                shared
+                    .metrics
+                    .logs_received
+                    .fetch_add(count as u64, Ordering::Relaxed);
 
                 if shared.envelope_tx.capacity() == 0 {
-                    return (
-                        axum::http::StatusCode::TOO_MANY_REQUESTS,
-                        "buffer full",
-                    )
+                    return (axum::http::StatusCode::TOO_MANY_REQUESTS, "buffer full")
                         .into_response();
                 }
 
@@ -1105,6 +1143,7 @@ pub struct OtelCollector {
     cancel: CancellationToken,
     metrics: OtelMetrics,
     #[cfg(feature = "otel")]
+    #[allow(dead_code)]
     enabled: bool,
 }
 
@@ -1207,19 +1246,34 @@ impl Collector for OtelCollector {
 
             if requests > 0 || !envelopes.is_empty() {
                 envelopes.push(helpers::metric_envelope(
-                    "otel.requests_total", requests as f64, &[], "counter",
+                    "otel.requests_total",
+                    requests as f64,
+                    &[],
+                    "counter",
                 ));
                 envelopes.push(helpers::metric_envelope(
-                    "otel.spans_received", spans as f64, &[], "counter",
+                    "otel.spans_received",
+                    spans as f64,
+                    &[],
+                    "counter",
                 ));
                 envelopes.push(helpers::metric_envelope(
-                    "otel.metrics_received", metrics_count as f64, &[], "counter",
+                    "otel.metrics_received",
+                    metrics_count as f64,
+                    &[],
+                    "counter",
                 ));
                 envelopes.push(helpers::metric_envelope(
-                    "otel.logs_received", logs_count as f64, &[], "counter",
+                    "otel.logs_received",
+                    logs_count as f64,
+                    &[],
+                    "counter",
                 ));
                 envelopes.push(helpers::metric_envelope(
-                    "otel.dropped", dropped as f64, &[], "counter",
+                    "otel.dropped",
+                    dropped as f64,
+                    &[],
+                    "counter",
                 ));
             }
 
@@ -1241,6 +1295,8 @@ impl Drop for OtelCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::{log_level, LogPayload, MetricPayload, MetricType};
+    use prost::Message;
 
     #[test]
     fn listen_addresses_are_localhost() {
@@ -1304,8 +1360,7 @@ mod tests {
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].signal_type, SignalType::Trace);
 
-        let payload: serde_json::Value =
-            serde_json::from_slice(&envelopes[0].payload).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&envelopes[0].payload).unwrap();
         assert_eq!(payload["service_name"], "test-svc");
         assert_eq!(payload["operation_name"], "GET /api");
         assert_eq!(payload["kind"], "SERVER");
@@ -1321,9 +1376,7 @@ mod tests {
                     attributes: vec![otlp::KeyValue {
                         key: "service.name".to_string(),
                         value: Some(otlp::AnyValue {
-                            value: Some(otlp::any_value::Value::StringValue(
-                                "my-app".to_string(),
-                            )),
+                            value: Some(otlp::any_value::Value::StringValue("my-app".to_string())),
                         }),
                     }],
                 }),
@@ -1349,11 +1402,10 @@ mod tests {
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].signal_type, SignalType::Metric);
 
-        let payload: serde_json::Value =
-            serde_json::from_slice(&envelopes[0].payload).unwrap();
-        assert_eq!(payload["name"], "http.request.duration");
-        assert_eq!(payload["value"], 42.5);
-        assert_eq!(payload["metric_type"], "gauge");
+        let payload = MetricPayload::decode(envelopes[0].payload.as_slice()).unwrap();
+        assert_eq!(payload.name, "http.request.duration");
+        assert!((payload.value - 42.5).abs() < f64::EPSILON);
+        assert_eq!(payload.metric_type, MetricType::Gauge as i32);
     }
 
     #[test]
@@ -1364,9 +1416,7 @@ mod tests {
                     attributes: vec![otlp::KeyValue {
                         key: "service.name".to_string(),
                         value: Some(otlp::AnyValue {
-                            value: Some(otlp::any_value::Value::StringValue(
-                                "log-svc".to_string(),
-                            )),
+                            value: Some(otlp::any_value::Value::StringValue("log-svc".to_string())),
                         }),
                     }],
                 }),
@@ -1393,12 +1443,11 @@ mod tests {
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].signal_type, SignalType::Log);
 
-        let payload: serde_json::Value =
-            serde_json::from_slice(&envelopes[0].payload).unwrap();
-        assert_eq!(payload["message"], "connection refused");
-        assert_eq!(payload["severity"], "ERROR");
-        assert_eq!(payload["trace_id"], "abcd");
-        assert_eq!(payload["source"], "otel");
+        let payload = LogPayload::decode(envelopes[0].payload.as_slice()).unwrap();
+        assert_eq!(payload.message, "connection refused");
+        assert_eq!(payload.level, log_level::ERROR);
+        assert_eq!(payload.trace_id, "abcd");
+        assert_eq!(payload.source, "otel");
     }
 
     #[test]

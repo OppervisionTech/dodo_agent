@@ -99,13 +99,13 @@ pub mod ingestor_service_client {
             &mut self,
             request: impl tonic::IntoRequest<SubmitBatchRequest>,
         ) -> Result<tonic::Response<SubmitBatchResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|_| {
-                tonic::Status::new(tonic::Code::Unknown, "service not ready")
-            })?;
+            self.inner
+                .ready()
+                .await
+                .map_err(|_| tonic::Status::new(tonic::Code::Unknown, "service not ready"))?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/dodo.proto.v1.IngestorService/SubmitBatch",
-            );
+            let path =
+                http::uri::PathAndQuery::from_static("/dodo.proto.v1.IngestorService/SubmitBatch");
             self.inner.unary(request.into_request(), path, codec).await
         }
     }
@@ -258,13 +258,13 @@ pub mod command_service_client {
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = AgentCommandResult>,
         ) -> Result<tonic::Response<tonic::codec::Streaming<AgentCommand>>, tonic::Status> {
-            self.inner.ready().await.map_err(|_| {
-                tonic::Status::new(tonic::Code::Unknown, "service not ready")
-            })?;
+            self.inner
+                .ready()
+                .await
+                .map_err(|_| tonic::Status::new(tonic::Code::Unknown, "service not ready"))?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/dodo.proto.v1.CommandService/CommandStream",
-            );
+            let path =
+                http::uri::PathAndQuery::from_static("/dodo.proto.v1.CommandService/CommandStream");
             self.inner
                 .streaming(request.into_streaming_request(), path, codec)
                 .await

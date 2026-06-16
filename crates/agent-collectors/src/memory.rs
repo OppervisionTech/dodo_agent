@@ -192,7 +192,20 @@ impl Collector for MemoryCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::MetricPayload;
     use agent_platform::common::MockPlatform;
+    use prost::Message;
+
+    fn metric_names(envelopes: &[Envelope]) -> Vec<String> {
+        envelopes
+            .iter()
+            .filter_map(|e| {
+                MetricPayload::decode(e.payload.as_slice())
+                    .ok()
+                    .map(|p| p.name)
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn collects_memory_metrics() {
@@ -206,14 +219,7 @@ mod tests {
         // Should have at least the 12 base memory metrics
         assert!(envelopes.len() >= 12);
 
-        let names: Vec<String> = envelopes
-            .iter()
-            .filter_map(|e| {
-                let v: serde_json::Value = serde_json::from_slice(&e.payload).ok()?;
-                v["name"].as_str().map(|s| s.to_string())
-            })
-            .collect();
-
+        let names = metric_names(&envelopes);
         assert!(names.contains(&"memory.total.bytes".to_string()));
         assert!(names.contains(&"memory.used.bytes".to_string()));
         assert!(names.contains(&"memory.available.bytes".to_string()));
@@ -229,13 +235,14 @@ mod tests {
 
         let envelopes = collector.collect().await.unwrap();
         let usage_env = envelopes.iter().find(|e| {
-            let v: serde_json::Value = serde_json::from_slice(&e.payload).unwrap_or_default();
-            v["name"].as_str() == Some("memory.usage.percent")
+            MetricPayload::decode(e.payload.as_slice())
+                .ok()
+                .map(|p| p.name == "memory.usage.percent")
+                .unwrap_or(false)
         });
 
         assert!(usage_env.is_some());
-        let v: serde_json::Value = serde_json::from_slice(&usage_env.unwrap().payload).unwrap();
-        let pct = v["value"].as_f64().unwrap();
-        assert!(pct >= 0.0 && pct <= 100.0);
+        let parsed = MetricPayload::decode(usage_env.unwrap().payload.as_slice()).unwrap();
+        assert!(parsed.value >= 0.0 && parsed.value <= 100.0);
     }
 }

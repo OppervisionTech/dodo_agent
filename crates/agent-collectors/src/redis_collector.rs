@@ -221,13 +221,10 @@ impl RedisCollector {
         let addr = parse_redis_url(url)?;
         let connect_addr = format!("{}:{}", addr.host, addr.port);
 
-        let stream = tokio::time::timeout(
-            DEFAULT_TIMEOUT,
-            TcpStream::connect(&connect_addr),
-        )
-        .await
-        .map_err(|_| CollectorError::Timeout)?
-        .map_err(|e| CollectorError::Io(e.to_string()))?;
+        let stream = tokio::time::timeout(DEFAULT_TIMEOUT, TcpStream::connect(&connect_addr))
+            .await
+            .map_err(|_| CollectorError::Timeout)?
+            .map_err(|e| CollectorError::Io(e.to_string()))?;
 
         let mut reader = BufReader::new(stream);
 
@@ -416,10 +413,9 @@ impl RedisCollector {
         ));
 
         if role == "slave" {
-            let lag = get_f64(&info, "master_repl_offset")
-                - get_f64(&info, "slave_repl_offset");
+            let lag = get_f64(&info, "master_repl_offset") - get_f64(&info, "slave_repl_offset");
             envelopes.push(helpers::metric_envelope(
-                "redis.replication.lag_seconds",
+                "redis.replication.offset_lag_bytes",
                 lag.max(0.0),
                 &labels,
                 "gauge",
@@ -544,7 +540,8 @@ mod tests {
 
     #[test]
     fn parse_info_keyspace() {
-        let info = "db0:keys=100,expires=50,avg_ttl=1000\r\ndb1:keys=200,expires=30,avg_ttl=2000\r\n";
+        let info =
+            "db0:keys=100,expires=50,avg_ttl=1000\r\ndb1:keys=200,expires=30,avg_ttl=2000\r\n";
         let map = parse_info(info);
 
         let mut total_keys = 0i64;
