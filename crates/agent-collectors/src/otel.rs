@@ -11,7 +11,10 @@
 
 // Structs/functions in this file are only wired up under the `otel` feature.
 // Silence dead-code and unused-import lints for variants that don't enable it.
-#![cfg_attr(not(feature = "otel"), allow(dead_code, unused_imports, unused_variables))]
+#![cfg_attr(
+    not(feature = "otel"),
+    allow(dead_code, unused_imports, unused_variables)
+)]
 
 use std::future::Future;
 use std::pin::Pin;
