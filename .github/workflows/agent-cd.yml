@@ -197,12 +197,17 @@ jobs:
             --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
             --set image.tag=sha-$(echo "${{ github.sha }}" | cut -c1-7) \
             --set gitSha=${{ github.sha }} \
-            --set "imagePullSecrets[0].name=ghcr-pull-secret" \
             -n dodo \
-            --create-namespace \
-            --atomic \
-            --timeout 10m \
-            --wait
+            --create-namespace
+
+      - name: Attach imagePullSecret to ServiceAccount
+        run: |
+          kubectl patch serviceaccount aegis-agent -n dodo \
+            -p '{"imagePullSecrets": [{"name": "ghcr-pull-secret"}]}'
+          kubectl rollout restart daemonset/aegis-agent -n dodo
+
+      - name: Wait for DaemonSet rollout
+        run: kubectl rollout status daemonset/aegis-agent -n dodo --timeout=10m
 
       - name: Debug pods on failure
         if: failure()
