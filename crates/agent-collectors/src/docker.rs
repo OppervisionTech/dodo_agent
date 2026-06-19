@@ -559,8 +559,8 @@ mod tests {
     async fn collector_inactive_without_docker() {
         let collector = DockerCollector::new("test-host".to_string());
         // On CI/dev machine without Docker socket, should return empty
-        let envelopes = collector.collect().await.unwrap();
+        let _envelopes = collector.collect().await.unwrap();
         // Either empty (no docker) or has metrics (docker present)
-        // Just verify it doesn't crash — len() is always valid
+        // Just verify it doesn't crash
     }
 }

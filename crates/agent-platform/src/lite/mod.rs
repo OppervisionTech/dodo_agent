@@ -554,7 +554,7 @@ fn collect_packages() -> PlatformResult<Vec<PackageInfo>> {
                     // Split at the last '-' that precedes a digit.
                     if let Some(idx) = line.rmatch_indices('-').find_map(|(i, _)| {
                         line.get(i + 1..i + 2).and_then(|c| {
-                            if c.chars().next().map_or(false, |ch| ch.is_ascii_digit()) {
+                            if c.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
                                 Some(i)
                             } else {
                                 None
@@ -757,7 +757,7 @@ fn build_platform_info() -> PlatformResult<PlatformInfo> {
     let total_memory = meminfo
         .lines()
         .find(|l| l.starts_with("MemTotal:"))
-        .and_then(|l| parse_meminfo_kb(l))
+        .and_then(parse_meminfo_kb)
         .map(|(_, v)| v)
         .unwrap_or(0);
 
