@@ -143,6 +143,16 @@ jobs:
           doctl kubernetes cluster kubeconfig save ${{ vars.DOKS_CLUSTER_NAME }} \
             --expiry-seconds 3600
 
+      - name: Configure namespace pod security
+        run: |
+          kubectl create namespace dodo --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace dodo \
+            pod-security.kubernetes.io/enforce=privileged \
+            pod-security.kubernetes.io/enforce-version=latest \
+            pod-security.kubernetes.io/warn=privileged \
+            pod-security.kubernetes.io/warn-version=latest \
+            --overwrite
+
       - name: Helm dependency build
         working-directory: helm-charts
         run: helm dependency build charts/aegis-agent
