@@ -561,7 +561,6 @@ mod tests {
         // On CI/dev machine without Docker socket, should return empty
         let envelopes = collector.collect().await.unwrap();
         // Either empty (no docker) or has metrics (docker present)
-        // Just verify it doesn't crash
-        assert!(envelopes.len() >= 0);
+        // Just verify it doesn't crash — len() is always valid
     }
 }
