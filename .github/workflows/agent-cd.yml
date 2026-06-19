@@ -175,7 +175,6 @@ jobs:
             --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
             --set image.tag=sha-$(echo "${{ github.sha }}" | cut -c1-7) \
             --set gitSha=${{ github.sha }} \
-            --set "imagePullSecrets[0].name=ghcr-pull-secret" \
             -n dodo \
             --create-namespace \
             --dry-run=client
@@ -213,11 +212,14 @@ jobs:
         if: failure()
         run: |
           echo "=== Pod status ==="
-          kubectl get pods -n dodo -o wide || true
-          echo "=== Pod describe ==="
-          kubectl describe pods -n dodo -l app.kubernetes.io/name=aegis-agent || true
+          kubectl get pods -n dodo -l app.kubernetes.io/name=aegis-agent -o wide || true
+          echo "=== Container logs ==="
+          for pod in $(kubectl get pods -n dodo -l app.kubernetes.io/name=aegis-agent -o name 2>/dev/null | head -2); do
+            echo "--- $pod ---"
+            kubectl logs -n dodo "$pod" --previous 2>/dev/null || kubectl logs -n dodo "$pod" 2>/dev/null || true
+          done
           echo "=== Events ==="
-          kubectl get events -n dodo --sort-by='.lastTimestamp' | tail -20 || true
+          kubectl get events -n dodo --sort-by='.lastTimestamp' | grep -i "aegis-agent" | tail -20 || true
 
       - name: Helm status
         run: helm list -n dodo
