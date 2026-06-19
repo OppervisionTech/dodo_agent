@@ -153,6 +153,15 @@ jobs:
             pod-security.kubernetes.io/warn-version=latest \
             --overwrite
 
+      - name: Create GHCR imagePullSecret
+        run: |
+          kubectl create secret docker-registry ghcr-pull-secret \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GH_PAT }} \
+            --namespace dodo \
+            --dry-run=client -o yaml | kubectl apply -f -
+
       - name: Helm dependency build
         working-directory: helm-charts
         run: helm dependency build charts/aegis-agent
@@ -166,6 +175,7 @@ jobs:
             --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
             --set image.tag=sha-$(echo "${{ github.sha }}" | cut -c1-7) \
             --set gitSha=${{ github.sha }} \
+            --set "imagePullSecrets[0].name=ghcr-pull-secret" \
             -n dodo \
             --create-namespace \
             --dry-run=client
@@ -187,11 +197,22 @@ jobs:
             --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
             --set image.tag=sha-$(echo "${{ github.sha }}" | cut -c1-7) \
             --set gitSha=${{ github.sha }} \
+            --set "imagePullSecrets[0].name=ghcr-pull-secret" \
             -n dodo \
             --create-namespace \
             --atomic \
             --timeout 10m \
             --wait
+
+      - name: Debug pods on failure
+        if: failure()
+        run: |
+          echo "=== Pod status ==="
+          kubectl get pods -n dodo -o wide || true
+          echo "=== Pod describe ==="
+          kubectl describe pods -n dodo -l app.kubernetes.io/name=aegis-agent || true
+          echo "=== Events ==="
+          kubectl get events -n dodo --sort-by='.lastTimestamp' | tail -20 || true
 
       - name: Helm status
         run: helm list -n dodo
