@@ -37,6 +37,51 @@ pub fn is_pseudo_filesystem(fs_type: &str) -> bool {
     EXCLUDED_FILESYSTEMS.contains(&fs_type)
 }
 
+/// Default on-disk path for the generated machine-id fallback (see
+/// [`resolve_machine_id`]). Deliberately distinct from the agent_id path
+/// (config-driven, `main.rs::load_or_create_agent_id`) — one identifies
+/// "which agent install", the other "which physical host".
+pub const FALLBACK_HOST_ID_PATH: &str = "/var/lib/aegis-agent/host-id";
+
+/// Resolves a stable machine identity: `/etc/machine-id`, then
+/// `/var/lib/dbus/machine-id`, then a UUID generated once and persisted to
+/// `fallback_path` so it survives agent restarts even on hosts without
+/// systemd/D-Bus. Deliberately never returns a literal `"unknown"` — every
+/// host missing both standard files would otherwise collide under the same
+/// id, defeating host-level dedup server-side rather than merely degrading it.
+pub fn resolve_machine_id(fallback_path: &str) -> String {
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(id) = std::fs::read_to_string(path) {
+            let id = id.trim().to_string();
+            if !id.is_empty() {
+                return id;
+            }
+        }
+    }
+
+    read_or_generate_persisted(fallback_path)
+}
+
+/// Reads an id from `path` if present and non-empty; otherwise generates a
+/// UUID, persists it to `path`, and returns it. Split out from
+/// [`resolve_machine_id`] specifically so this tier is unit-testable without
+/// depending on the real host's `/etc/machine-id` being absent.
+fn read_or_generate_persisted(path: &str) -> String {
+    if let Ok(id) = std::fs::read_to_string(path) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, &id);
+    id
+}
+
 /// TCP state codes from /proc/net/tcp.
 pub fn tcp_state_name(state: u8) -> &'static str {
     match state {
@@ -257,5 +302,37 @@ impl Platform for MockPlatform {
 
     fn read_file_string(&self, _path: &str) -> PlatformResult<String> {
         Ok(String::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two independent calls against a fresh path (simulating a host with
+    /// neither /etc/machine-id nor /var/lib/dbus/machine-id, exercised
+    /// directly since real dev/CI machines do have /etc/machine-id) must
+    /// agree — the whole point of persisting the generated id is that it
+    /// survives agent restarts, unlike the old bare `"unknown"` fallback,
+    /// which was both non-unique and "stable" only by accident (always the
+    /// same literal string across every such host).
+    #[test]
+    fn read_or_generate_persisted_survives_across_calls() {
+        let dir =
+            std::env::temp_dir().join(format!("aegis-agent-test-host-id-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("host-id");
+        let path = path.to_str().unwrap();
+
+        let first = read_or_generate_persisted(path);
+        let second = read_or_generate_persisted(path);
+
+        assert_eq!(first, second, "generated id must persist across calls");
+        assert!(!first.is_empty());
+        assert_ne!(
+            first, "unknown",
+            "must never fall back to the literal \"unknown\""
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

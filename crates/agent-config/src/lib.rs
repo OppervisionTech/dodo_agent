@@ -39,6 +39,14 @@ pub struct LocalAgentConfig {
     pub config_pull_interval_seconds: u32,
     #[serde(default = "default_agent_id_path")]
     pub agent_id_path: String,
+    /// HTTPS endpoint for agent certificate auto-enrollment on first boot.
+    /// Set to empty string to disable enrollment (manual cert management).
+    #[serde(default = "default_enrollment_endpoint")]
+    pub enrollment_endpoint: String,
+}
+
+fn default_enrollment_endpoint() -> String {
+    "https://kong.aegisops.io:443/v1/enroll".to_string()
 }
 
 fn default_endpoint() -> EndpointLocalConfig {
@@ -65,6 +73,7 @@ impl Default for LocalAgentConfig {
             redaction_patterns: Vec::new(),
             config_pull_interval_seconds: 60,
             agent_id_path: default_agent_id_path(),
+            enrollment_endpoint: default_enrollment_endpoint(),
         }
     }
 }

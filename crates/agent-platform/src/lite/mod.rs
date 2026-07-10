@@ -21,7 +21,9 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::common::{is_pseudo_filesystem, tcp_state_name};
+use crate::common::{
+    is_pseudo_filesystem, resolve_machine_id, tcp_state_name, FALLBACK_HOST_ID_PATH,
+};
 use crate::*;
 
 // ---------------------------------------------------------------------------
@@ -711,11 +713,7 @@ fn build_platform_info() -> PlatformResult<PlatformInfo> {
         .trim()
         .to_string();
 
-    let machine_id = read_string("/etc/machine-id")
-        .or_else(|_| read_string("/var/lib/dbus/machine-id"))
-        .unwrap_or_else(|_| "unknown".into())
-        .trim()
-        .to_string();
+    let machine_id = resolve_machine_id(FALLBACK_HOST_ID_PATH);
 
     let os_version = read_string("/etc/os-release")
         .map(|c| {
