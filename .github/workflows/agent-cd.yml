@@ -44,7 +44,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Determine target registries
+        id: registries
+        run: |
+          enabled="${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}"
+          echo "dockerhub_enabled=$enabled" >> "$GITHUB_OUTPUT"
+          images="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          if [ "$enabled" = "true" ]; then
+            images="${images}
+          docker.io/oppervisiontech/dodo-agent"
+          fi
+          {
+            echo "images<<REGISTRIES_EOF"
+            echo "$images"
+            echo "REGISTRIES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: docker/login-action@v3
+        if: steps.registries.outputs.dockerhub_enabled == 'true'
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -53,9 +70,7 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            docker.io/oppervisiontech/dodo-agent
+          images: ${{ steps.registries.outputs.images }}
           tags: |
             type=raw,value=${{ github.event.inputs.environment || 'staging' }}
             type=sha,prefix=sha-
