@@ -52,7 +52,7 @@ jobs:
           images="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           if [ "$enabled" = "true" ]; then
             images="${images}
-          docker.io/oppervisiontech/dodo-agent"
+          docker.io/enzotrevisan9/dodo-agent"
           fi
           {
             echo "images<<REGISTRIES_EOF"
