@@ -50,7 +50,19 @@ impl CommandChannel {
 
             info!(agent_id = %self.agent_id, "connecting CommandStream");
 
-            match self.connect_and_run(&cancel).await {
+            // A hung DNS/TCP/TLS handshake inside connect_and_run is otherwise
+            // uninterruptible: tls.rs's connect_timeout bounds it eventually,
+            // but shutdown must not have to wait that long — select against
+            // cancellation so a shutdown mid-connect returns immediately.
+            let connect_result = tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!(agent_id = %self.agent_id, "CommandChannel shutting down mid-connect");
+                    return;
+                }
+                result = self.connect_and_run(&cancel) => result,
+            };
+
+            match connect_result {
                 Ok(()) => {
                     info!(agent_id = %self.agent_id, "CommandStream closed cleanly");
                     if cancel.is_cancelled() {
@@ -105,9 +117,11 @@ impl CommandChannel {
             .map_err(|_| CommandError::Transport("result channel closed".into()))?;
 
         let outbound = ReceiverStream::new(result_rx);
+        let mut request = tonic::Request::new(outbound);
+        agent_transport::attach_auth_metadata(&mut request, &self.config);
 
         let response = client
-            .command_stream(outbound)
+            .command_stream(request)
             .await
             .map_err(|e| CommandError::Transport(e.to_string()))?;
 

@@ -76,6 +76,9 @@ tokio-rustls = "0.26"
 # X.509
 x509-parser = "0.16"
 
+# CSR generation (agent certificate enrollment)
+rcgen = "0.12"
+
 # Glob pattern matching (for log file discovery)
 glob = "0.3"
 

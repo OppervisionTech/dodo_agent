@@ -24,11 +24,17 @@ impl ConfigWatcher {
 
     /// Run the config watcher loop.
     /// Sends new config through the channel when changes are detected.
+    /// If poll_interval_seconds is 0, config pull is disabled and this returns immediately.
     pub async fn run(
         &mut self,
         config_tx: tokio::sync::watch::Sender<LocalAgentConfig>,
         cancel_token: CancellationToken,
     ) {
+        if self.poll_interval_seconds == 0 {
+            debug!("config_pull_interval_seconds = 0, config watcher disabled");
+            cancel_token.cancelled().await;
+            return;
+        }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             self.poll_interval_seconds as u64,
         ));

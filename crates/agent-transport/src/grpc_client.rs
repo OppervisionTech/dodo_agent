@@ -1,6 +1,6 @@
 use crate::proto::{self, IngestorServiceClient};
 use crate::retry::{with_retry, RetryConfig};
-use crate::{SubmitResult, TransportConfig, TransportError, TransportResult};
+use crate::{attach_auth_metadata, SubmitResult, TransportConfig, TransportError, TransportResult};
 use agent_core::Envelope;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -98,19 +98,7 @@ impl GrpcClient {
         let mut client = IngestorServiceClient::new(channel);
         let mut request = tonic::Request::new(proto::SubmitBatchRequest { envelopes });
 
-        // Attach API key as gRPC metadata header when configured
-        if let Some(ref key) = self.config.api_key {
-            if !key.is_empty() {
-                match tonic::metadata::MetadataValue::try_from(key.as_str()) {
-                    Ok(val) => {
-                        request.metadata_mut().insert("x-api-key", val);
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "failed to attach api_key to gRPC metadata");
-                    }
-                }
-            }
-        }
+        attach_auth_metadata(&mut request, &self.config);
 
         let response = client
             .submit_batch(request)

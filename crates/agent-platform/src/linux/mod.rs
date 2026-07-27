@@ -1,5 +1,6 @@
 use crate::*;
 
+use crate::common::{resolve_machine_id, FALLBACK_HOST_ID_PATH};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -201,9 +202,7 @@ impl Platform for LinuxPlatform {
             })
             .unwrap_or_else(|_| "unknown".to_string());
 
-        let machine_id = fs::read_to_string("/etc/machine-id")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "unknown".to_string());
+        let machine_id = resolve_machine_id(FALLBACK_HOST_ID_PATH);
 
         let cpuinfo = fs::read_to_string("/proc/cpuinfo").map_err(PlatformError::Io)?;
         let cpu_count_logical = cpuinfo
