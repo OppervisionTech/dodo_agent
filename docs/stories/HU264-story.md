@@ -64,6 +64,35 @@ plano de referência) — mitigado por rede de segurança de teste obrigatória
 antes de mover, migração função por função, e reversão do commit se qualquer
 combinação de feature quebrar.
 
+## Item 4.2.1 (enroll_with_retry → with_retry) — não se aplica, plano estava errado
+
+O plano descrevia isto como "menor risco — reuso de função já testada":
+substituir `main.rs::enroll_with_retry()` por `agent_transport::retry::with_retry`.
+Ao ler os dois, não são intercambiáveis:
+
+- `with_retry` (retry.rs) é especificamente tipado para operações de submit
+  gRPC: assinatura fixa em `Fut: Future<Output = TransportResult<SubmitResult>>`,
+  e sua lógica de "retryable vs não-retryable" é por *código gRPC*
+  (`UNAVAILABLE`/`DEADLINE_EXCEEDED` retry; `INVALID_ARGUMENT`/
+  `UNAUTHENTICATED`/`RESOURCE_EXHAUSTED` não retry).
+- `enroll_with_retry` (main.rs:534) chama `enrollment::enroll_if_needed`, uma
+  chamada HTTP-ish ao portal, retorna `()`, e retenta **todo e qualquer erro**
+  igualmente — sem essa distinção por código.
+- `enroll_with_retry` tem um schedule de backoff (6 tentativas, base 2s, cap
+  15s) documentado como deliberadamente calibrado para durar mais que os 30s
+  de cache negativo do `dodo_ingestor` (`INGESTOR_AUTH_NEGATIVE_CACHE_TTL`) —
+  um acoplamento cross-service documentado em comentário extenso no código.
+  Esse comportamento é o motivo de existir uma função separada, não um
+  descuido a corrigir.
+
+Forçar os dois a compartilhar implementação exigiria generalizar `with_retry`
+para um combinator genérico de retry (mudança de design real, não mecânica) E
+preservar a semântica "retry tudo" de `enroll_with_retry` como um caso
+diferente da seleção por código gRPC — risco e esforço reais, não o "reuso
+de função já testada, menor risco" que o plano assumia. Pulado nesta rodada;
+não é dead code nem duplicação de fato, são duas políticas de retry
+diferentes para dois protocolos diferentes.
+
 ## Plano de referência
 
 Ver `/home/enzot/.claude/plans/rode-um-plano-para-logical-pancake.md`, Fase 4.
