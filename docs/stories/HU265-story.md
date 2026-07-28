@@ -56,6 +56,14 @@ Bump de dependências num binário que roda como DaemonSet privilegiado em todo 
 | **Denial of Service** | Esta é a motivação central da HU: `RUSTSEC-2026-0185` é literalmente um vetor de exaustão de memória remota (severidade 7.5) — corrigir reduz superfície de DoS contra o agent. |
 | **Elevation of Privilege** | Sem mudança em como o agent decide o que coletar/executar. |
 
+## Resultado
+
+- `crossbeam-epoch` atualizado 0.9.18 → 0.9.20 via `cargo update -p crossbeam-epoch --precise 0.9.20` (`RUSTSEC-2026-0204` corrigido).
+- `quinn-proto` atualizado 0.11.14 → 0.11.15 via `cargo update -p quinn-proto --precise 0.11.15` (`RUSTSEC-2026-0185` corrigido).
+- Ambos são dependências transitivas (`crossbeam-epoch` via `moka` → `hickory-resolver` → `mongodb` → `agent-collectors`; `quinn-proto` não aparece na árvore resolvida para nenhum target/feature atual — entrada órfã no lockfile, possivelmente de uma dependência opcional não habilitada por padrão). O bump via `cargo update -p` resolveu ambos sem precisar tocar em nenhum `Cargo.toml` — só `Cargo.lock` mudou (8 linhas).
+- `cargo audit` local após o bump: 0 vulnerabilidades, 4 avisos (`rustls-pemfile` unmaintained, `anyhow` unsound, `rand` 0.8.5 e `rand` 0.9.2 unsound) — sem correção disponível hoje em nenhum dos 4. Esses avisos já não bloqueavam o gate (`cargo audit` só retorna exit 1 para vulnerabilidades reais, os 4 aparecem como "allowed warnings"), então nenhuma decisão de `.cargo/audit.toml` foi necessária para desbloquear o CI. Ficam documentados aqui como débito conhecido, sem ação nesta HU — revisar quando houver patch upstream.
+- Checkpoint completo rodado: `cargo audit` limpo, `cargo fmt --check` limpo, `cargo clippy -D warnings` limpo nas 3 features (linux/lite/windows), `cargo test --workspace` linux 81/0 e lite 71/0 (mesmos números da baseline da HU264, sem regressão), `cargo build --release` limpo em linux/lite/windows.
+
 ## Plano de referência
 
 Sem plano de referência prévio — esta HU nasce do achado do gate `Security Audit`, não do plano de limpeza (`/home/enzot/.claude/plans/rode-um-plano-para-logical-pancake.md`).
