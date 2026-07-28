@@ -47,13 +47,15 @@ mod tests {
     #[test]
     fn test_merge_collectors_override() {
         let local = LocalAgentConfig::default();
-        let mut remote = LocalAgentConfig::default();
-        remote.collectors = vec![crate::CollectorLocalConfig {
-            name: "cpu".to_string(),
-            enabled: true,
-            interval_seconds: 10,
-            parameters: Default::default(),
-        }];
+        let remote = LocalAgentConfig {
+            collectors: vec![crate::CollectorLocalConfig {
+                name: "cpu".to_string(),
+                enabled: true,
+                interval_seconds: 10,
+                parameters: Default::default(),
+            }],
+            ..Default::default()
+        };
 
         let merged = merge(&local, &remote);
         assert_eq!(merged.collectors.len(), 1);
