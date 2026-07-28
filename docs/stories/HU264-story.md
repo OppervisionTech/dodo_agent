@@ -93,6 +93,41 @@ de função já testada, menor risco" que o plano assumia. Pulado nesta rodada;
 não é dead code nem duplicação de fato, são duas políticas de retry
 diferentes para dois protocolos diferentes.
 
+## Item 4.2.2 (Delta<T> genérico) — escopo reduzido, plano só parcialmente correto
+
+O plano descrevia "`Delta<T>` genérico para o padrão `PreviousState` redefinido
+em 7+ collectors". Confirmado: 7 arquivos têm algum conceito de "guardar
+amostra anterior" (`cpu.rs`, `network.rs`, `disk.rs`, `docker.rs`,
+`postgres.rs`, `mongodb_collector.rs`, `redis_collector.rs`, mais
+`security.rs`). Mas ao ler os 7, não são o mesmo padrão:
+
+- `security.rs`: `PreviousState` é `{ ports: HashMap<...>, file_hashes:
+  HashMap<...> }` — snapshot-diff para detecção de mudança, não delta de
+  contador. Não se aplica a um `Delta<T>` numérico de forma alguma.
+- `cpu.rs`/`network.rs`/`disk.rs`/`docker.rs`: chamam `.saturating_sub()`
+  diretamente inline, campo por campo, sem indireção — já é o código mínimo
+  possível para cada um; não há duplicação de *lógica* a extrair aqui, só de
+  *forma* (todos calculam uma subtração saturada), o que não justifica uma
+  abstração.
+- `postgres.rs`/`mongodb_collector.rs`/`redis_collector.rs`: estes 3, sim,
+  redefiniam uma closure **idêntica** (`|c, p| c.saturating_sub(p).max(0) as
+  f64`, só variando o nome da variável) — duplicação real e mecanicamente
+  extraível.
+
+Um `Delta<T>` genérico como *tipo* (envolvendo os campos de `PreviousState`)
+não se sustenta porque cada `PreviousState` tem campos completamente
+diferentes (contadores i64 vs HashMaps). O que existe de duplicação real e
+segura de extrair é a *função* de delta, não a struct. Implementado:
+`agent-collectors::delta::counter_delta(current, previous) -> f64`
+(saturating_sub + clamp a 0, mesma semântica exata das 3 closures que
+substituiu), com 4 testes unitários cobrindo aumento normal, sem mudança,
+reset de contador (wraparound simulado) e `previous = i64::MAX`.
+
+Checkpoint nas 3 features: cargo clippy -D warnings (limpo), cargo fmt
+--check (limpo), cargo test --workspace (linux 85/0 — 81 + 4 novos de
+delta.rs; lite 75/0 — 71 + 4), cargo build --release (linux/lite/windows,
+todos compilam).
+
 ## Plano de referência
 
 Ver `/home/enzot/.claude/plans/rode-um-plano-para-logical-pancake.md`, Fase 4.

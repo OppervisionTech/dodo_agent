@@ -5,6 +5,7 @@
 //! independent modules that can be enabled/disabled via config.
 
 pub mod client_config;
+pub mod delta;
 pub mod helpers;
 
 pub mod certs;
