@@ -16,6 +16,8 @@ use agent_core::{Collector, CollectorError, Envelope, SignalType};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::client_config::optional_target_from_env;
+use crate::delta::counter_delta;
 use crate::helpers;
 
 const COLLECT_INTERVAL_SECS: u64 = 15;
@@ -50,13 +52,7 @@ pub struct PostgresCollector {
 
 impl PostgresCollector {
     pub fn new(host_id: String) -> Self {
-        let dsn = std::env::var(DSN_ENV_VAR).ok();
-
-        if dsn.is_some() {
-            info!("PostgreSQL collector configured (DSN from env)");
-        } else {
-            info!("PostgreSQL collector inactive (no DSN configured)");
-        }
+        let dsn = optional_target_from_env(DSN_ENV_VAR, "PostgreSQL", "DSN");
 
         Self {
             host_id,
@@ -219,49 +215,45 @@ impl PostgresCollector {
                     // Delta calculations
                     let mut prev_guard = self.previous.lock().await;
                     if let Some(prev) = prev_guard.as_ref() {
-                        let delta = |curr: i64, prev: i64| -> f64 {
-                            curr.saturating_sub(prev).max(0) as f64
-                        };
-
                         envelopes.push(helpers::metric_envelope(
                             "postgresql.transactions.committed",
-                            delta(xact_commit, prev.xact_commit),
+                            counter_delta(xact_commit, prev.xact_commit),
                             &labels,
                             "counter",
                         ));
                         envelopes.push(helpers::metric_envelope(
                             "postgresql.transactions.rolledback",
-                            delta(xact_rollback, prev.xact_rollback),
+                            counter_delta(xact_rollback, prev.xact_rollback),
                             &labels,
                             "counter",
                         ));
                         envelopes.push(helpers::metric_envelope(
                             "postgresql.tuples.inserted",
-                            delta(tup_inserted, prev.tup_inserted),
+                            counter_delta(tup_inserted, prev.tup_inserted),
                             &labels,
                             "counter",
                         ));
                         envelopes.push(helpers::metric_envelope(
                             "postgresql.tuples.updated",
-                            delta(tup_updated, prev.tup_updated),
+                            counter_delta(tup_updated, prev.tup_updated),
                             &labels,
                             "counter",
                         ));
                         envelopes.push(helpers::metric_envelope(
                             "postgresql.tuples.deleted",
-                            delta(tup_deleted, prev.tup_deleted),
+                            counter_delta(tup_deleted, prev.tup_deleted),
                             &labels,
                             "counter",
                         ));
                         envelopes.push(helpers::metric_envelope(
                             "postgresql.tuples.fetched",
-                            delta(tup_fetched, prev.tup_fetched),
+                            counter_delta(tup_fetched, prev.tup_fetched),
                             &labels,
                             "counter",
                         ));
                         envelopes.push(helpers::metric_envelope(
                             "postgresql.deadlocks",
-                            delta(deadlocks, prev.deadlocks),
+                            counter_delta(deadlocks, prev.deadlocks),
                             &labels,
                             "counter",
                         ));

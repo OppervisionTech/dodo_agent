@@ -16,8 +16,10 @@ use agent_core::{Collector, CollectorError, Envelope, SignalType};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
+use crate::client_config::optional_target_from_env;
+use crate::delta::counter_delta;
 use crate::helpers;
 
 const COLLECT_INTERVAL_SECS: u64 = 10;
@@ -197,13 +199,7 @@ pub struct RedisCollector {
 
 impl RedisCollector {
     pub fn new(host_id: String) -> Self {
-        let url = std::env::var(URL_ENV_VAR).ok();
-
-        if url.is_some() {
-            info!("Redis collector configured (URL from env)");
-        } else {
-            info!("Redis collector inactive (no URL configured)");
-        }
+        let url = optional_target_from_env(URL_ENV_VAR, "Redis", "URL");
 
         Self {
             host_id,
@@ -317,9 +313,8 @@ impl RedisCollector {
 
         let mut prev_guard = self.previous.lock().await;
         if let Some(prev) = prev_guard.as_ref() {
-            let d = |c: i64, p: i64| -> f64 { c.saturating_sub(p).max(0) as f64 };
-            let hits_delta = d(hits, prev.keyspace_hits);
-            let misses_delta = d(misses, prev.keyspace_misses);
+            let hits_delta = counter_delta(hits, prev.keyspace_hits);
+            let misses_delta = counter_delta(misses, prev.keyspace_misses);
 
             envelopes.push(helpers::metric_envelope(
                 "redis.keyspace.hits",
@@ -349,13 +344,13 @@ impl RedisCollector {
 
             envelopes.push(helpers::metric_envelope(
                 "redis.evictions",
-                d(evicted, prev.evicted_keys),
+                counter_delta(evicted, prev.evicted_keys),
                 &labels,
                 "counter",
             ));
             envelopes.push(helpers::metric_envelope(
                 "redis.connections.rejected",
-                d(rejected, prev.rejected_connections),
+                counter_delta(rejected, prev.rejected_connections),
                 &labels,
                 "counter",
             ));

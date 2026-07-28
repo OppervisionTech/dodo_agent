@@ -1,4 +1,5 @@
 use thiserror::Error;
+#[cfg(feature = "enabled")]
 use tracing::{info, warn};
 
 #[derive(Error, Debug)]
@@ -122,6 +123,7 @@ impl Drop for EbpfManager {
 
 // When eBPF feature is not enabled, provide a no-op stub
 #[cfg(not(feature = "enabled"))]
+#[derive(Default)]
 pub struct EbpfManager;
 
 #[cfg(not(feature = "enabled"))]
