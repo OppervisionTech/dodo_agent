@@ -4,6 +4,7 @@
 //! registered with the scheduler at agent startup. Collectors are
 //! independent modules that can be enabled/disabled via config.
 
+pub mod client_config;
 pub mod helpers;
 
 pub mod certs;

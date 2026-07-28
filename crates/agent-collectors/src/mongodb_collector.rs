@@ -16,6 +16,7 @@ use agent_core::{Collector, CollectorError, Envelope, SignalType};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::client_config::optional_target_from_env;
 use crate::helpers;
 
 const COLLECT_INTERVAL_SECS: u64 = 15;
@@ -49,13 +50,7 @@ pub struct MongodbCollector {
 
 impl MongodbCollector {
     pub fn new(host_id: String) -> Self {
-        let uri = std::env::var(URI_ENV_VAR).ok();
-
-        if uri.is_some() {
-            info!("MongoDB collector configured (URI from env)");
-        } else {
-            info!("MongoDB collector inactive (no URI configured)");
-        }
+        let uri = optional_target_from_env(URI_ENV_VAR, "MongoDB", "URI");
 
         Self {
             host_id,

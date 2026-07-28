@@ -16,6 +16,7 @@ use agent_core::{Collector, CollectorError, Envelope, SignalType};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::client_config::optional_target_from_env;
 use crate::helpers;
 
 const COLLECT_INTERVAL_SECS: u64 = 15;
@@ -50,13 +51,7 @@ pub struct PostgresCollector {
 
 impl PostgresCollector {
     pub fn new(host_id: String) -> Self {
-        let dsn = std::env::var(DSN_ENV_VAR).ok();
-
-        if dsn.is_some() {
-            info!("PostgreSQL collector configured (DSN from env)");
-        } else {
-            info!("PostgreSQL collector inactive (no DSN configured)");
-        }
+        let dsn = optional_target_from_env(DSN_ENV_VAR, "PostgreSQL", "DSN");
 
         Self {
             host_id,
