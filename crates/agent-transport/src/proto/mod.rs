@@ -95,6 +95,10 @@ pub mod ingestor_service_client {
         <T::ResponseBody as tonic::codegen::Body>::Error:
             Into<Box<dyn std::error::Error + Send + Sync>> + Send,
     {
+        // tonic::Status (176+ bytes) matches the signature tonic-build itself
+        // generates for gRPC client methods; boxing it here would diverge from
+        // that convention and ripple into every call site that matches on it.
+        #[allow(clippy::result_large_err)]
         pub async fn submit_batch(
             &mut self,
             request: impl tonic::IntoRequest<SubmitBatchRequest>,
@@ -254,6 +258,8 @@ pub mod command_service_client {
     {
         /// Open a bidirectional stream for agent command dispatch.
         /// The agent sends AgentCommandResult; the server sends AgentCommand.
+        // See submit_batch() above for why tonic::Status isn't boxed here.
+        #[allow(clippy::result_large_err)]
         pub async fn command_stream(
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = AgentCommandResult>,
