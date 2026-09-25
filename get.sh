@@ -28,7 +28,10 @@ readonly HEALTH_PORT="9090"
 # Server mode directories
 readonly INSTALL_DIR="/usr/local/bin"
 readonly CONFIG_DIR="/etc/aegis"
-readonly CERTS_DIR="/etc/aegis/certs"
+# Certs live under DATA_DIR (not CONFIG_DIR): the systemd unit mounts
+# /etc/aegis read-only (ReadOnlyPaths), but the agent process needs to write
+# ca.pem/agent.pem/agent-key.pem here itself via mTLS auto-enrollment.
+readonly CERTS_DIR="/var/lib/aegis/certs"
 readonly DATA_DIR="/var/lib/aegis"
 readonly BUFFER_DIR="/var/lib/aegis/buffer"
 readonly LOG_DIR="/var/log/aegis"
@@ -54,6 +57,7 @@ ok()    { printf "${GREEN}[ OK ]${RESET}  %s\n" "$*"; }
 DODO_MODE="${DODO_MODE:-}"
 DODO_API_KEY="${DODO_API_KEY:-}"
 DODO_ENDPOINT="${DODO_ENDPOINT:-}"
+DODO_ENROLLMENT_ENDPOINT="${DODO_ENROLLMENT_ENDPOINT:-}"
 DODO_VARIANT="${DODO_VARIANT:-}"
 DODO_VERSION="${DODO_VERSION:-latest}"
 DODO_NAMESPACE="${DODO_NAMESPACE:-dodo}"
@@ -63,15 +67,16 @@ DODO_NON_INTERACTIVE="${DODO_NON_INTERACTIVE:-false}"
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --mode)             DODO_MODE="$2";             shift 2 ;;
-      --api-key)          DODO_API_KEY="$2";          shift 2 ;;
-      --endpoint)         DODO_ENDPOINT="$2";         shift 2 ;;
-      --variant)          DODO_VARIANT="$2";          shift 2 ;;
-      --version)          DODO_VERSION="$2";          shift 2 ;;
-      --namespace)        DODO_NAMESPACE="$2";        shift 2 ;;
-      --tls-secret)       DODO_TLS_SECRET="$2";       shift 2 ;;
-      --non-interactive)  DODO_NON_INTERACTIVE=true;  shift ;;
-      --)                 shift; break ;;
+      --mode)                DODO_MODE="$2";                shift 2 ;;
+      --api-key)             DODO_API_KEY="$2";              shift 2 ;;
+      --endpoint)             DODO_ENDPOINT="$2";             shift 2 ;;
+      --enrollment-endpoint) DODO_ENROLLMENT_ENDPOINT="$2";  shift 2 ;;
+      --variant)              DODO_VARIANT="$2";              shift 2 ;;
+      --version)              DODO_VERSION="$2";              shift 2 ;;
+      --namespace)            DODO_NAMESPACE="$2";            shift 2 ;;
+      --tls-secret)           DODO_TLS_SECRET="$2";           shift 2 ;;
+      --non-interactive)      DODO_NON_INTERACTIVE=true;      shift ;;
+      --)                     shift; break ;;
       -*) warn "Unknown option: $1"; shift ;;
     esac
   done
@@ -97,6 +102,12 @@ validate_inputs() {
   if [[ -n "${DODO_ENDPOINT}" ]]; then
     if ! [[ "${DODO_ENDPOINT}" =~ ^[a-zA-Z0-9._-]+:[0-9]+$ ]]; then
       error "Invalid --endpoint '${DODO_ENDPOINT}'. Expected format: hostname:port"
+    fi
+  fi
+
+  if [[ -n "${DODO_ENROLLMENT_ENDPOINT}" ]]; then
+    if ! [[ "${DODO_ENROLLMENT_ENDPOINT}" =~ ^https://[a-zA-Z0-9._-]+(:[0-9]+)?/.+ ]]; then
+      error "Invalid --enrollment-endpoint '${DODO_ENROLLMENT_ENDPOINT}'. Expected format: https://hostname[:port]/path"
     fi
   fi
 
@@ -134,6 +145,39 @@ detect_platform() {
       DODO_VARIANT="linux"
     fi
   fi
+}
+
+# ─── Enrollment Endpoint Derivation ───────────────────────────────────────────
+
+# Known production gRPC endpoint whose enrollment endpoint we can safely infer.
+readonly PROD_GRPC_ENDPOINT="kong.aegisops.io:443"
+readonly PROD_ENROLLMENT_ENDPOINT="https://kong.aegisops.io:443/v1/enroll"
+
+# Populates DODO_ENROLLMENT_ENDPOINT if not already set via --enrollment-endpoint.
+#
+# We deliberately do NOT derive the enrollment host from DODO_ENDPOINT's host in
+# the general case: gRPC ingest and HTTPS enrollment are not guaranteed to share
+# a hostname per environment (e.g. staging uses grpc.staging.oppervision.com.br
+# for gRPC but api.staging.oppervision.com.br for enrollment, to keep ALPN
+# unambiguous between h2/grpcs and https on Kong). Only the known production
+# default is safe to infer automatically.
+derive_enrollment_endpoint() {
+  if [[ -n "${DODO_ENROLLMENT_ENDPOINT}" ]]; then
+    return 0
+  fi
+
+  if [[ "${DODO_ENDPOINT}" == "${PROD_GRPC_ENDPOINT}" ]]; then
+    DODO_ENROLLMENT_ENDPOINT="${PROD_ENROLLMENT_ENDPOINT}"
+    return 0
+  fi
+
+  if [[ "${DODO_NON_INTERACTIVE}" == "true" ]]; then
+    error "Custom --endpoint '${DODO_ENDPOINT}' has no known matching enrollment endpoint. Pass --enrollment-endpoint explicitly (gRPC ingest and HTTPS enrollment can live on different hostnames per environment)."
+  fi
+
+  warn "Custom endpoint detected — enrollment endpoint cannot be safely guessed (gRPC and enrollment hosts can differ per environment)."
+  prompt_if_empty DODO_ENROLLMENT_ENDPOINT "Enrollment endpoint (full HTTPS URL, e.g. https://api.example.com/v1/enroll)" ""
+  [[ -n "${DODO_ENROLLMENT_ENDPOINT}" ]] || error "Enrollment endpoint is required for a custom --endpoint."
 }
 
 # ─── Input Prompt Helpers ─────────────────────────────────────────────────────
@@ -306,6 +350,12 @@ tls:
   client_cert_path: "${CERTS_DIR}/agent.pem"
   client_key_path: "${CERTS_DIR}/agent-key.pem"
   verify_server: true
+
+# mTLS certificates are obtained automatically on first start via
+# certificate auto-enrollment (POST to enrollment_endpoint using the API key
+# in /etc/aegis/agent.env) — no manual certificate placement needed. Leave
+# empty to disable auto-enrollment and manage certificates manually instead.
+enrollment_endpoint: "${DODO_ENROLLMENT_ENDPOINT}"
 
 buffer:
   path: "${BUFFER_DIR}"
@@ -590,6 +640,8 @@ server() {
 
   [[ -n "${DODO_API_KEY}" ]] || error "API key is required for server mode. Use --api-key or set DODO_API_KEY."
 
+  derive_enrollment_endpoint
+
   step "Creating system user '${SERVICE_USER}'"
   if ! id "${SERVICE_USER}" &>/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
@@ -623,6 +675,9 @@ server() {
   _write_agent_env
 
   step "Setting permissions"
+  # CERTS_DIR lives under DATA_DIR, so this recursive chown also covers it —
+  # the agent process (running as SERVICE_USER) needs write access there to
+  # perform mTLS auto-enrollment on first start.
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}" "${LOG_DIR}"
   chown -R "root:${SERVICE_USER}" "${CONFIG_DIR}"
   chmod 750 "${CONFIG_DIR}"
@@ -647,27 +702,58 @@ verify_server() {
   printf "\n${BOLD}Binary checksum:${RESET}\n"
   sha256sum "${INSTALL_DIR}/aegis-agent"
 
+  local service_started=false
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl start aegis-agent 2>/dev/null; then
-      sleep 2
-      if systemctl is-active --quiet aegis-agent; then
-        ok "Service is running"
-      else
-        warn "Service started but exited — TLS certs likely missing (expected)"
-      fi
+      service_started=true
     else
-      warn "Service did not start — TLS certificates likely missing (expected)"
+      warn "Service failed to start — check: systemctl status aegis-agent"
+    fi
+  fi
+
+  # `systemctl is-active` alone doesn't prove enrollment succeeded: the agent
+  # process stays up and just buffers to disk indefinitely if enrollment
+  # keeps failing. Poll for the enrolled certificate instead — timeout covers
+  # enroll_with_retry's worst case (6 attempts, backoff up to 15s each) with
+  # margin.
+  if [[ "${service_started}" == "true" ]]; then
+    step "Waiting for automatic mTLS certificate enrollment"
+    local attempts=0 max=35
+    while [[ ! -f "${CERTS_DIR}/agent.pem" ]]; do
+      attempts=$((attempts + 1))
+      if [[ "${attempts}" -ge "${max}" ]]; then
+        break
+      fi
+      sleep 2
+    done
+
+    if [[ -f "${CERTS_DIR}/agent.pem" ]]; then
+      ok "Agent enrolled — mTLS certificates written to ${CERTS_DIR}/"
+    else
+      warn "No certificates found yet after $((max * 2))s."
+      warn "Check enrollment logs: journalctl -u aegis-agent -f | grep -i enroll"
+    fi
+
+    if systemctl is-active --quiet aegis-agent; then
+      ok "Service is running"
+    else
+      warn "Service is not active — check: systemctl status aegis-agent"
     fi
   fi
 
   printf "\n${BOLD}Next steps:${RESET}\n"
-  printf "  1. Place mTLS certificates in ${CERTS_DIR}/\n"
-  printf "       ca.pem          CA certificate\n"
-  printf "       agent.pem       client certificate\n"
-  printf "       agent-key.pem   client private key (chmod 600)\n"
-  printf "  2. Start the agent:   systemctl start aegis-agent\n"
-  printf "  3. Check status:      systemctl status aegis-agent\n"
-  printf "  4. Follow logs:       journalctl -u aegis-agent -f\n"
+  printf "  1. Enrollment is automatic — the agent used the API key in\n"
+  printf "     ${CONFIG_DIR}/agent.env to self-enroll mTLS certificates on first start.\n"
+  printf "     No manual certificate placement is needed.\n"
+  printf "  2. Check status:      systemctl status aegis-agent\n"
+  printf "  3. Follow logs:       journalctl -u aegis-agent -f\n"
+  printf "  4. If enrollment failed, verify the API key and enrollment endpoint:\n"
+  printf "       cat ${CONFIG_DIR}/agent.env      (redact before sharing)\n"
+  printf "       grep enrollment_endpoint ${CONFIG_DIR}/agent.yaml\n"
+  printf "     then restart:       systemctl restart aegis-agent\n"
+  printf "  5. To manage certificates manually instead (e.g. air-gapped hosts),\n"
+  printf "     set enrollment_endpoint: \"\" in ${CONFIG_DIR}/agent.yaml and place\n"
+  printf "     ca.pem / agent.pem / agent-key.pem in ${CERTS_DIR}/ yourself.\n"
   printf "\n"
 }
 
@@ -687,8 +773,21 @@ _helm_deploy() {
   fi
 
   if [[ -n "${DODO_TLS_SECRET}" ]]; then
+    # Static/pre-provisioned certs (e.g. air-gapped clusters) — takes
+    # precedence over self-enrollment in the chart's own logic, but we still
+    # pass the enrollment values below; the chart ignores them when
+    # tls.secretName is set.
     helm_args+=("--set" "tls.secretName=${DODO_TLS_SECRET}")
   fi
+
+  # Self-enrollment: the API key secret was already created by k8s() above.
+  # The chart uses it to auto-enroll mTLS certs unless DODO_TLS_SECRET (a
+  # static secret) was provided instead.
+  helm_args+=(
+    "--set" "apiKey.secretName=aegis-agent-credentials"
+    "--set" "apiKey.secretKey=api-key"
+    "--set" "enrollment.endpoint=${DODO_ENROLLMENT_ENDPOINT}"
+  )
 
   info "Trying OCI registry..."
   if helm upgrade --install aegis-agent "${HELM_OCI_CHART}" "${helm_args[@]}" 2>/dev/null; then
@@ -710,9 +809,11 @@ k8s() {
   prompt_if_empty DODO_API_KEY    "API Key"                                ""                     "true"
   prompt_if_empty DODO_ENDPOINT   "gRPC endpoint"                         "kong.aegisops.io:443"
   prompt_if_empty DODO_NAMESPACE  "Kubernetes namespace"                  "dodo"
-  prompt_if_empty DODO_TLS_SECRET "TLS secret name (leave blank to skip)" ""
+  prompt_if_empty DODO_TLS_SECRET "Static TLS secret name (leave blank to self-enroll automatically)" ""
 
   [[ -n "${DODO_API_KEY}" ]] || error "API key is required. Use --api-key or set DODO_API_KEY."
+
+  derive_enrollment_endpoint
 
   local ctx
   ctx="$(kubectl config current-context 2>/dev/null || echo 'unknown')"
@@ -759,7 +860,12 @@ verify_k8s() {
   printf "  DaemonSet:    kubectl -n %s describe daemonset aegis-agent\n" "${DODO_NAMESPACE}"
 
   if [[ -z "${DODO_TLS_SECRET}" ]]; then
-    printf "\n${YELLOW}[WARN]${RESET}  No TLS secret provided. Create and wire it up with:\n"
+    printf "\n${BOLD}mTLS:${RESET} no static secret given — agents self-enroll automatically\n"
+    printf "using the 'aegis-agent-credentials' API key secret. Verify with:\n"
+    printf "  kubectl -n %s exec ds/aegis-agent -- ls /var/lib/aegis-agent/certs\n" "${DODO_NAMESPACE}"
+    printf "  kubectl -n %s logs -l app.kubernetes.io/name=aegis-agent | grep -i enroll\n" "${DODO_NAMESPACE}"
+    printf "\n${BOLD}Air-gapped alternative:${RESET} to use pre-provisioned certificates instead,\n"
+    printf "skip self-enrollment with a static secret:\n"
     printf "  kubectl -n %s create secret generic aegis-tls \\\\\n" "${DODO_NAMESPACE}"
     printf "    --from-file=ca.crt=ca.pem \\\\\n"
     printf "    --from-file=tls.crt=agent.pem \\\\\n"
