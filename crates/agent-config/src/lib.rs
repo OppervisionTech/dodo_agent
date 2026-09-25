@@ -45,6 +45,13 @@ pub struct LocalAgentConfig {
     pub enrollment_endpoint: String,
 }
 
+/// Last-resort fallback only — not environment-aware. `get.sh` and the
+/// `aegis-agent` Helm chart always write an explicit `enrollment_endpoint`
+/// key into the generated config (deriving it per environment, since gRPC
+/// ingest and HTTPS enrollment are not guaranteed to share a hostname
+/// outside of production — see `derive_enrollment_endpoint()` in get.sh).
+/// This default only matters for hand-written configs that omit the key
+/// entirely, and always points at production.
 fn default_enrollment_endpoint() -> String {
     "https://kong.aegisops.io:443/v1/enroll".to_string()
 }
