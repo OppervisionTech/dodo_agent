@@ -1,9 +1,15 @@
 //! Process collector — HU023.
 //!
-//! Collects process-level metrics at 10-second intervals. Reports
+//! Collects process-level metrics (interval from config). Reports
 //! aggregate process counts by state, total thread count, and Top-N
-//! processes by CPU and memory usage. Command lines are run through
-//! the RedactionEngine before inclusion in payloads.
+//! processes by CPU and memory usage.
+//!
+//! Top-N series are labelled by process `name` and `rank` only. `pid` and
+//! `cmdline` used to be labels too, which made every process restart (new
+//! pid) and every argument change a brand-new time series — unbounded
+//! cardinality stored per host for 90 days, and the largest single driver
+//! of metric storage cost. Command lines also never leave the host now,
+//! which removes the redaction risk altogether.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,23 +26,22 @@ const DEFAULT_TOP_N: usize = 10;
 /// Collects process-level metrics with Top-N CPU/memory reporting.
 pub struct ProcessCollector {
     platform: Arc<dyn Platform>,
-    redaction: Arc<RedactionEngine>,
     top_n: usize,
 }
 
 impl ProcessCollector {
     /// Create a new process collector.
     ///
-    /// - `redaction`: Used to sanitize command lines before they leave the agent.
+    /// - `_redaction`: kept for API compatibility — command lines are no
+    ///   longer sent, so there is nothing left to redact.
     /// - `top_n`: How many top processes to report (default 10).
     pub fn new(
         platform: Arc<dyn Platform>,
-        redaction: Arc<RedactionEngine>,
+        _redaction: Arc<RedactionEngine>,
         top_n: Option<usize>,
     ) -> Self {
         Self {
             platform,
-            redaction,
             top_n: top_n.unwrap_or(DEFAULT_TOP_N),
         }
     }
@@ -121,16 +126,8 @@ impl Collector for ProcessCollector {
             });
 
             for (rank, p) in by_cpu.iter().take(self.top_n).enumerate() {
-                let pid_str = p.pid.to_string();
                 let rank_str = rank.to_string();
-                let redacted_cmd = self.redaction.redact(&p.cmdline);
-
-                let labels: [(&str, &str); 4] = [
-                    ("pid", &pid_str),
-                    ("name", &p.name),
-                    ("rank", &rank_str),
-                    ("cmdline", &redacted_cmd),
-                ];
+                let labels: [(&str, &str); 2] = [("name", &p.name), ("rank", &rank_str)];
 
                 envelopes.push(metric_envelope(
                     "process.top.cpu_percent",
@@ -147,16 +144,8 @@ impl Collector for ProcessCollector {
             by_mem.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes));
 
             for (rank, p) in by_mem.iter().take(self.top_n).enumerate() {
-                let pid_str = p.pid.to_string();
                 let rank_str = rank.to_string();
-                let redacted_cmd = self.redaction.redact(&p.cmdline);
-
-                let labels: [(&str, &str); 4] = [
-                    ("pid", &pid_str),
-                    ("name", &p.name),
-                    ("rank", &rank_str),
-                    ("cmdline", &redacted_cmd),
-                ];
+                let labels: [(&str, &str); 2] = [("name", &p.name), ("rank", &rank_str)];
 
                 envelopes.push(metric_envelope(
                     "process.top.memory_bytes",
@@ -235,5 +224,24 @@ mod tests {
         // The mock process cmdline is "/sbin/init" which has nothing to redact.
         // Verify it passes through without panic.
         assert!(!envelopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn top_n_labels_exclude_pid_and_cmdline() {
+        let platform = Arc::new(MockPlatform::new()) as Arc<dyn Platform>;
+        let collector = ProcessCollector::new(platform, test_redaction(), None);
+
+        let envelopes = collector.collect().await.unwrap();
+        let mut top = 0;
+        for e in &envelopes {
+            let p = MetricPayload::decode(e.payload.as_slice()).unwrap();
+            if p.name.starts_with("process.top.") {
+                top += 1;
+                assert!(!p.labels.contains_key("pid"), "{} has pid", p.name);
+                assert!(!p.labels.contains_key("cmdline"), "{} has cmdline", p.name);
+                assert!(p.labels.contains_key("name") && p.labels.contains_key("rank"));
+            }
+        }
+        assert!(top > 0);
     }
 }

@@ -400,53 +400,35 @@ fn register_collectors(
             continue;
         }
 
-        match cc.name.as_str() {
-            "cpu" => {
-                registry.register(Box::new(agent_collectors::CpuCollector::new(
-                    platform.clone(),
-                )));
-            }
-            "memory" => {
-                registry.register(Box::new(agent_collectors::MemoryCollector::new(
-                    platform.clone(),
-                )));
-            }
-            "disk" => {
-                registry.register(Box::new(agent_collectors::DiskCollector::new(
-                    platform.clone(),
-                )));
-            }
-            "network" => {
-                registry.register(Box::new(agent_collectors::NetworkCollector::new(
-                    platform.clone(),
-                )));
-            }
-            "process" => {
-                registry.register(Box::new(agent_collectors::ProcessCollector::new(
-                    platform.clone(),
-                    redaction_engine.clone(),
-                    Some(10),
-                )));
-            }
+        let collector: Box<dyn agent_core::Collector> = match cc.name.as_str() {
+            "cpu" => Box::new(agent_collectors::CpuCollector::new(platform.clone())),
+            "memory" => Box::new(agent_collectors::MemoryCollector::new(platform.clone())),
+            "disk" => Box::new(agent_collectors::DiskCollector::new(platform.clone())),
+            "network" => Box::new(agent_collectors::NetworkCollector::new(platform.clone())),
+            "process" => Box::new(agent_collectors::ProcessCollector::new(
+                platform.clone(),
+                redaction_engine.clone(),
+                Some(10),
+            )),
             "security" => {
                 let monitored_files = cc
                     .parameters
                     .get("monitored_files")
                     .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
-                registry.register(Box::new(agent_collectors::SecurityCollector::new(
+                Box::new(agent_collectors::SecurityCollector::new(
                     platform.clone(),
                     monitored_files,
-                )));
+                ))
             }
             "certs" => {
                 let scan_paths = cc
                     .parameters
                     .get("scan_paths")
                     .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
-                registry.register(Box::new(agent_collectors::CertsCollector::new(
+                Box::new(agent_collectors::CertsCollector::new(
                     platform.clone(),
                     scan_paths,
-                )));
+                ))
             }
             "logs" => {
                 let log_paths: Vec<String> = cc
@@ -458,66 +440,50 @@ fn register_collectors(
                     .parameters
                     .get("max_lines_per_sec")
                     .and_then(|s| s.parse().ok());
-                registry.register(Box::new(agent_collectors::LogsCollector::new(
+                Box::new(agent_collectors::LogsCollector::new(
                     platform.clone(),
                     log_paths,
                     max_lines,
-                )));
+                ))
             }
             "otel" => {
                 let rate_limit = cc.parameters.get("rate_limit").and_then(|s| s.parse().ok());
-                registry.register(Box::new(agent_collectors::OtelCollector::new(rate_limit)));
+                Box::new(agent_collectors::OtelCollector::new(rate_limit))
             }
-            "kubernetes" => {
-                registry.register(Box::new(agent_collectors::KubernetesCollector::new(
-                    platform.clone(),
-                )));
-            }
-            "inventory" => {
-                registry.register(Box::new(agent_collectors::InventoryCollector::new(
-                    platform.clone(),
-                )));
-            }
-            "self_metrics" => {
-                registry.register(Box::new(agent_collectors::SelfMetricsCollector::new(
-                    platform.clone(),
-                    agent_state.clone(),
-                    None,
-                )));
-            }
-            "heartbeat" => {
-                registry.register(Box::new(agent_collectors::HeartbeatCollector::new(
-                    agent_state.clone(),
-                )));
-            }
+            "kubernetes" => Box::new(agent_collectors::KubernetesCollector::new(platform.clone())),
+            "inventory" => Box::new(agent_collectors::InventoryCollector::new(platform.clone())),
+            "self_metrics" => Box::new(agent_collectors::SelfMetricsCollector::new(
+                platform.clone(),
+                agent_state.clone(),
+                None,
+            )),
+            "heartbeat" => Box::new(agent_collectors::HeartbeatCollector::new(
+                agent_state.clone(),
+            )),
             #[cfg(feature = "docker")]
-            "docker" => {
-                registry.register(Box::new(agent_collectors::DockerCollector::new(
-                    agent_state.host_id.clone(),
-                )));
-            }
+            "docker" => Box::new(agent_collectors::DockerCollector::new(
+                agent_state.host_id.clone(),
+            )),
             #[cfg(feature = "postgres")]
-            "postgres" => {
-                registry.register(Box::new(agent_collectors::PostgresCollector::new(
-                    agent_state.host_id.clone(),
-                )));
-            }
+            "postgres" => Box::new(agent_collectors::PostgresCollector::new(
+                agent_state.host_id.clone(),
+            )),
             #[cfg(feature = "mongodb")]
-            "mongodb" => {
-                registry.register(Box::new(agent_collectors::MongodbCollector::new(
-                    agent_state.host_id.clone(),
-                )));
-            }
+            "mongodb" => Box::new(agent_collectors::MongodbCollector::new(
+                agent_state.host_id.clone(),
+            )),
             #[cfg(feature = "redis-collector")]
-            "redis" => {
-                registry.register(Box::new(agent_collectors::RedisCollector::new(
-                    agent_state.host_id.clone(),
-                )));
-            }
+            "redis" => Box::new(agent_collectors::RedisCollector::new(
+                agent_state.host_id.clone(),
+            )),
             unknown => {
                 warn!(collector = unknown, "unknown collector name, skipping");
+                continue;
             }
-        }
+        };
+        // The config interval (validated >= 1 by the loader) is what runs —
+        // collectors' built-in intervals are only a fallback.
+        registry.register_with_interval(collector, cc.interval_seconds);
     }
 }
 

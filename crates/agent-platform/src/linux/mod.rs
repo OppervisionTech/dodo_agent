@@ -398,6 +398,11 @@ impl Platform for LinuxPlatform {
                 continue;
             }
 
+            // Skip loop devices / RAM disks (snaps, mounted images)
+            if common::is_virtual_block_device(device) {
+                continue;
+            }
+
             // Skip duplicate devices (keep first mount point)
             if !seen_devices.insert(device.to_string()) {
                 continue;
@@ -462,9 +467,15 @@ impl Platform for LinuxPlatform {
 
             let device = fields[2].to_string();
 
+            // Loop devices / RAM disks are not host disks (see
+            // common::is_virtual_block_device) — skip before anything else.
+            if common::is_virtual_block_device(&device) {
+                continue;
+            }
+
             // Skip partitions (e.g., sda1) — only report whole devices and device-mapper
             // A simple heuristic: if the device name ends with a digit and is not a dm- device,
-            // check if a parent device exists (e.g. sda for sda1). We keep dm- and loop devices.
+            // check if a parent device exists (e.g. sda for sda1). We keep dm- devices.
             let is_partition = device
                 .chars()
                 .last()

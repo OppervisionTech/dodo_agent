@@ -225,36 +225,39 @@ pub struct CollectorLocalConfig {
     pub parameters: std::collections::HashMap<String, String>,
 }
 
+// Host metrics default to 15s (the industry norm — Datadog's agent too):
+// 3× fewer points than the old 5s, which made metric storage the largest
+// per-host cost. Operators can lower it per collector in agent.yaml.
 fn default_collectors() -> Vec<CollectorLocalConfig> {
     vec![
         CollectorLocalConfig {
             name: "cpu".into(),
             enabled: true,
-            interval_seconds: 5,
+            interval_seconds: 15,
             parameters: Default::default(),
         },
         CollectorLocalConfig {
             name: "memory".into(),
             enabled: true,
-            interval_seconds: 5,
+            interval_seconds: 15,
             parameters: Default::default(),
         },
         CollectorLocalConfig {
             name: "disk".into(),
             enabled: true,
-            interval_seconds: 10,
+            interval_seconds: 15,
             parameters: Default::default(),
         },
         CollectorLocalConfig {
             name: "network".into(),
             enabled: true,
-            interval_seconds: 5,
+            interval_seconds: 15,
             parameters: Default::default(),
         },
         CollectorLocalConfig {
             name: "process".into(),
             enabled: true,
-            interval_seconds: 10,
+            interval_seconds: 15,
             parameters: Default::default(),
         },
         CollectorLocalConfig {

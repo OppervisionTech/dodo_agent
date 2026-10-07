@@ -31,26 +31,28 @@ labels: {}
 
 redaction_patterns: []
 
+# Host metrics every 15s (3x less storage than 5s). Lower per collector if
+# you need finer resolution — it is billed as more data points.
 collectors:
   - name: cpu
     enabled: true
-    interval_seconds: 5
+    interval_seconds: 15
 
   - name: memory
     enabled: true
-    interval_seconds: 5
+    interval_seconds: 15
 
   - name: disk
     enabled: true
-    interval_seconds: 10
+    interval_seconds: 15
 
   - name: network
     enabled: true
-    interval_seconds: 5
+    interval_seconds: 15
 
   - name: process
     enabled: true
-    interval_seconds: 10
+    interval_seconds: 15
 
   - name: security
     enabled: true

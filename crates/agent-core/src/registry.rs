@@ -2,7 +2,11 @@
 //!
 //! Part of HU013 (core loop, scheduler, collector trait).
 
-use crate::Collector;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
+use crate::{Collector, CollectorError, Envelope, SignalType};
 
 /// Registry that holds all collector instances.
 ///
@@ -31,6 +35,23 @@ impl CollectorRegistry {
         self.collectors.push(collector);
     }
 
+    /// Register a collector, running it every `interval_seconds` from the
+    /// agent config instead of its built-in default (0 = keep the default).
+    /// Collectors hard-code a fallback interval; the config value — what
+    /// operators actually tune, and what the platform's COGS model assumes —
+    /// must win.
+    pub fn register_with_interval(&mut self, collector: Box<dyn Collector>, interval_seconds: u32) {
+        let configured = Duration::from_secs(u64::from(interval_seconds));
+        if interval_seconds == 0 || configured == collector.interval() {
+            self.register(collector);
+        } else {
+            self.register(Box::new(IntervalOverride {
+                inner: collector,
+                interval: configured,
+            }));
+        }
+    }
+
     /// Borrow the list of registered collectors.
     pub fn collectors(&self) -> &[Box<dyn Collector>] {
         &self.collectors
@@ -54,6 +75,33 @@ impl CollectorRegistry {
     }
 }
 
+/// Wraps a collector to run it on a different schedule; everything else is
+/// delegated unchanged.
+struct IntervalOverride {
+    inner: Box<dyn Collector>,
+    interval: Duration,
+}
+
+impl Collector for IntervalOverride {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn signal_type(&self) -> SignalType {
+        self.inner.signal_type()
+    }
+
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    fn collect(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Envelope>, CollectorError>> + Send + '_>> {
+        self.inner.collect()
+    }
+}
+
 impl Default for CollectorRegistry {
     fn default() -> Self {
         Self::new()
@@ -67,10 +115,6 @@ impl Default for CollectorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CollectorError, Envelope, SignalType};
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::time::Duration;
 
     struct DummyCollector {
         name: &'static str,
@@ -118,5 +162,25 @@ mod tests {
         let collectors = reg.into_collectors();
         assert_eq!(collectors.len(), 1);
         assert_eq!(collectors[0].name(), "disk");
+    }
+
+    #[tokio::test]
+    async fn config_interval_overrides_the_builtin_default() {
+        let mut reg = CollectorRegistry::new();
+        reg.register_with_interval(Box::new(DummyCollector { name: "cpu" }), 15);
+        reg.register_with_interval(Box::new(DummyCollector { name: "memory" }), 0);
+        reg.register_with_interval(Box::new(DummyCollector { name: "disk" }), 5);
+
+        let c = reg.collectors();
+        assert_eq!(c[0].interval(), Duration::from_secs(15));
+        assert_eq!(c[0].name(), "cpu");
+        assert_eq!(c[0].signal_type(), SignalType::Metric);
+        assert!(c[0].collect().await.unwrap().is_empty());
+        assert_eq!(
+            c[1].interval(),
+            Duration::from_secs(5),
+            "0 keeps the default"
+        );
+        assert_eq!(c[2].interval(), Duration::from_secs(5));
     }
 }

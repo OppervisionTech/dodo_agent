@@ -37,6 +37,15 @@ pub fn is_pseudo_filesystem(fs_type: &str) -> bool {
     EXCLUDED_FILESYSTEMS.contains(&fs_type)
 }
 
+/// Virtual block devices whose metrics are noise for host monitoring: loop
+/// devices (snap packages, mounted images — dozens per Ubuntu host) and RAM
+/// disks. Each one would otherwise add its own disk.io/disk.space series to
+/// every host, which is pure storage cost. Accepts "loop0" or "/dev/loop0".
+pub fn is_virtual_block_device(device: &str) -> bool {
+    let name = device.strip_prefix("/dev/").unwrap_or(device);
+    name.starts_with("loop") || name.starts_with("ram")
+}
+
 /// Default on-disk path for the generated machine-id fallback (see
 /// [`resolve_machine_id`]). Deliberately distinct from the agent_id path
 /// (config-driven, `main.rs::load_or_create_agent_id`) — one identifies
@@ -334,5 +343,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn virtual_block_devices_are_detected() {
+        for dev in ["loop0", "/dev/loop12", "ram0", "/dev/ram15"] {
+            assert!(is_virtual_block_device(dev), "{dev}");
+        }
+        for dev in [
+            "sda",
+            "/dev/sda1",
+            "nvme0n1",
+            "dm-0",
+            "/dev/mapper/root",
+            "xvda",
+            "vda",
+        ] {
+            assert!(!is_virtual_block_device(dev), "{dev}");
+        }
     }
 }
