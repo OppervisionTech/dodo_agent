@@ -126,7 +126,8 @@ impl MongodbCollector {
         // `service` matches the db.system / peer.service name OTEL spans use, so
         // the metric worker files these under the same service id as the
         // topology node (/services/{name} timeline).
-        let mut base_labels: Vec<(&str, &str)> = vec![("host_id", &self.host_id), ("service", "mongodb")];
+        let mut base_labels: Vec<(&str, &str)> =
+            vec![("host_id", &self.host_id), ("service", "mongodb")];
         let repl_set_str;
         if let Some(ref rs) = repl_set {
             repl_set_str = rs.clone();

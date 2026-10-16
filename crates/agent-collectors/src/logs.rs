@@ -23,7 +23,9 @@ use crate::helpers::log_envelope;
 /// plain path keeps the file path as source.
 fn split_service(entry: &str) -> (Option<&str>, &str) {
     match entry.split_once('=') {
-        Some((svc, path)) if !svc.is_empty() && !svc.contains('/') => (Some(svc.trim()), path.trim()),
+        Some((svc, path)) if !svc.is_empty() && !svc.contains('/') => {
+            (Some(svc.trim()), path.trim())
+        }
         _ => (None, entry),
     }
 }
@@ -428,9 +430,18 @@ mod tests {
 
     #[test]
     fn service_prefix_sets_source() {
-        assert_eq!(split_service("postgresql=/var/log/pg/*.log"), (Some("postgresql"), "/var/log/pg/*.log"));
-        assert_eq!(split_service("/var/log/app.log"), (None, "/var/log/app.log"));
-        assert_eq!(split_service("/var/log/a=b.log"), (None, "/var/log/a=b.log"));
+        assert_eq!(
+            split_service("postgresql=/var/log/pg/*.log"),
+            (Some("postgresql"), "/var/log/pg/*.log")
+        );
+        assert_eq!(
+            split_service("/var/log/app.log"),
+            (None, "/var/log/app.log")
+        );
+        assert_eq!(
+            split_service("/var/log/a=b.log"),
+            (None, "/var/log/a=b.log")
+        );
         assert_eq!(
             expand_paths(&["redis=/nonexistent/r.log".into()]),
             vec![("/nonexistent/r.log".to_string(), "redis".to_string())]

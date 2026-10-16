@@ -1,3 +1,6 @@
+// gRPC client methods return tonic::Status, whose size is fixed by tonic;
+// boxing it would diverge from the generated-client API.
+#![allow(clippy::result_large_err)]
 /// Manually defined proto types matching dodo.proto.v1 schema.
 /// Uses prost for serialization, tonic for gRPC transport.
 
