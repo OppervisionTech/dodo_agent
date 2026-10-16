@@ -108,7 +108,10 @@ impl PostgresCollector {
         let client = client_guard.as_ref().expect("connection ensured above");
 
         let mut envelopes = Vec::new();
-        let labels: Vec<(&str, &str)> = vec![("host_id", &self.host_id)];
+        // `service` matches the db.system / peer.service name OTEL spans use, so
+        // the metric worker files these under the same service id as the
+        // topology node (/services/{name} timeline).
+        let labels: Vec<(&str, &str)> = vec![("host_id", &self.host_id), ("service", "postgresql")];
 
         // -- Connection stats --
         match client

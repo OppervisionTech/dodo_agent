@@ -250,10 +250,14 @@ impl RedisCollector {
             .get("role")
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
+        // `service` matches the db.system / peer.service name OTEL spans use, so
+        // the metric worker files these under the same service id as the
+        // topology node (/services/{name} timeline).
         let labels: Vec<(&str, &str)> = vec![
             ("redis_version", &redis_version),
             ("role", &role),
             ("host_id", &self.host_id),
+            ("service", "redis"),
         ];
 
         // -- Connections --
