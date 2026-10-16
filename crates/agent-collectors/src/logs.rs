@@ -16,18 +16,35 @@ use tokio::sync::Mutex;
 
 use crate::helpers::log_envelope;
 
-/// Expand a list of paths (which may include glob patterns) to concrete file paths.
+/// Split an optional `service=` prefix off a configured path entry.
+///
+/// `postgresql=/var/log/pg/*.log` tags every line from matching files with
+/// source `postgresql`, which the log worker stores as the service id. A
+/// plain path keeps the file path as source.
+fn split_service(entry: &str) -> (Option<&str>, &str) {
+    match entry.split_once('=') {
+        Some((svc, path)) if !svc.is_empty() && !svc.contains('/') => {
+            (Some(svc.trim()), path.trim())
+        }
+        _ => (None, entry),
+    }
+}
+
+/// Expand a list of paths (which may include glob patterns) to concrete
+/// `(file path, source)` pairs.
 /// Glob patterns use the standard `*`, `?`, `[abc]` syntax.
 /// Non-glob paths are included as-is (missing files are silently skipped at read time).
-fn expand_paths(paths: &[String]) -> Vec<String> {
+fn expand_paths(entries: &[String]) -> Vec<(String, String)> {
     let mut result = Vec::new();
-    for path in paths {
+    for entry in entries {
+        let (service, path) = split_service(entry);
+        let source = |file: &str| service.unwrap_or(file).to_string();
         if path.contains('*') || path.contains('?') || path.contains('[') {
             match glob::glob(path) {
                 Ok(entries) => {
                     for entry in entries.flatten() {
                         if let Some(s) = entry.to_str() {
-                            result.push(s.to_string());
+                            result.push((s.to_string(), source(s)));
                         }
                     }
                 }
@@ -36,7 +53,7 @@ fn expand_paths(paths: &[String]) -> Vec<String> {
                 }
             }
         } else {
-            result.push(path.clone());
+            result.push((path.to_string(), source(path)));
         }
     }
     result
@@ -247,7 +264,7 @@ impl Collector for LogsCollector {
             // Re-expand glob patterns each cycle to pick up new log files
             let resolved_paths = expand_paths(&self.log_path_patterns);
 
-            for path in &resolved_paths {
+            for (path, source) in &resolved_paths {
                 // Read the full file content via platform abstraction.
                 // In production this would use seek + read from offset.
                 // For MVP, we read the full file and track offset.
@@ -312,7 +329,7 @@ impl Collector for LogsCollector {
                     envelopes.push(log_envelope(
                         line,
                         severity,
-                        path,
+                        source,
                         &[("format", format_label)],
                         trace_id.as_deref(),
                         span_id.as_deref(),
@@ -409,5 +426,25 @@ mod tests {
 
         let envelopes = collector.collect().await.unwrap();
         assert!(envelopes.is_empty());
+    }
+
+    #[test]
+    fn service_prefix_sets_source() {
+        assert_eq!(
+            split_service("postgresql=/var/log/pg/*.log"),
+            (Some("postgresql"), "/var/log/pg/*.log")
+        );
+        assert_eq!(
+            split_service("/var/log/app.log"),
+            (None, "/var/log/app.log")
+        );
+        assert_eq!(
+            split_service("/var/log/a=b.log"),
+            (None, "/var/log/a=b.log")
+        );
+        assert_eq!(
+            expand_paths(&["redis=/nonexistent/r.log".into()]),
+            vec![("/nonexistent/r.log".to_string(), "redis".to_string())]
+        );
     }
 }
