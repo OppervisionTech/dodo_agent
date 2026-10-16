@@ -259,6 +259,27 @@ impl DockerCollector {
 
         let mut seen_ids: Vec<String> = Vec::new();
 
+        // stats?stream=false blocks ~2s per container (Docker waits for a
+        // second CPU sample), so fetching them one by one blows the
+        // collection timeout on hosts with a dozen+ containers. Fetch all
+        // running containers' stats concurrently up front.
+        let mut stats_by_id: HashMap<String, Result<Vec<u8>, CollectorError>> = HashMap::new();
+        {
+            let mut set = tokio::task::JoinSet::new();
+            for c in containers.iter().filter(|c| c.state == "running") {
+                let id = c.id.clone();
+                set.spawn(async move {
+                    let res = docker_get(&format!("/containers/{id}/stats?stream=false")).await;
+                    (id, res)
+                });
+            }
+            while let Some(joined) = set.join_next().await {
+                if let Ok((id, res)) = joined {
+                    stats_by_id.insert(id, res);
+                }
+            }
+        }
+
         for container in &containers {
             let short_id = &container.id[..12.min(container.id.len())];
             let name = container
@@ -280,8 +301,10 @@ impl DockerCollector {
                 running += 1;
 
                 // Get stats for running containers
-                let stats_path = format!("/containers/{}/stats?stream=false", container.id);
-                match docker_get(&stats_path).await {
+                let stats = stats_by_id
+                    .remove(&container.id)
+                    .unwrap_or_else(|| Err(CollectorError::Failed("stats task failed".into())));
+                match stats {
                     Ok(stats_body) => {
                         match serde_json::from_slice::<ContainerStats>(&stats_body) {
                             Ok(stats) => {
