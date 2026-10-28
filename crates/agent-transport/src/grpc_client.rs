@@ -95,6 +95,7 @@ impl GrpcClient {
         channel: tonic::transport::Channel,
         envelopes: Vec<proto::AgentEnvelope>,
     ) -> TransportResult<SubmitResult> {
+        let count = envelopes.len();
         let mut client = IngestorServiceClient::new(channel);
         let mut request = tonic::Request::new(proto::SubmitBatchRequest { envelopes });
 
@@ -108,6 +109,11 @@ impl GrpcClient {
                 message: e.message().to_string(),
             })?;
         let resp = response.into_inner();
+        if u64::from(resp.accepted) + u64::from(resp.rejected) != count as u64 {
+            return Err(TransportError::NotRetryable(
+                "invalid upstream acknowledgement count".into(),
+            ));
+        }
         Ok(SubmitResult {
             accepted: resp.accepted,
             rejected: resp.rejected,

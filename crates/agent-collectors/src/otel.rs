@@ -36,6 +36,8 @@ use crate::helpers;
 const GRPC_LISTEN_ADDR: &str = "127.0.0.1:4317";
 const HTTP_LISTEN_ADDR: &str = "127.0.0.1:4318";
 const BUFFER_CAPACITY: usize = 10_000;
+const CAPACITY_REJECTION: &str = "receiver capacity exceeded";
+const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_PER_SEC: u64 = 50_000;
 
 // ---------------------------------------------------------------------------
@@ -418,27 +420,104 @@ struct OtelShared {
 }
 
 impl OtelShared {
+    // Reserve the complete batch before accepting anything. Exporters may retry
+    // transient errors; accepting a subset then returning one duplicates data.
     fn try_send(&self, envelopes: Vec<Envelope>) -> usize {
-        let mut sent = 0;
-        for env in envelopes {
-            let current_rate = self.metrics.rate_counter.load(Ordering::Relaxed);
-            if current_rate >= self.rate_limit_per_sec {
-                self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+        let count = envelopes.len();
+        if count == 0 {
+            return 0;
+        }
+        let permits = match self.envelope_tx.try_reserve_many(count) {
+            Ok(permits) => permits,
+            Err(_) => {
+                self.metrics
+                    .dropped
+                    .fetch_add(count as u64, Ordering::Relaxed);
+                return 0;
+            }
+        };
+        if self
+            .metrics
+            .rate_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(count as u64)
+                    .filter(|next| *next <= self.rate_limit_per_sec)
+            })
+            .is_err()
+        {
+            self.metrics
+                .dropped
+                .fetch_add(count as u64, Ordering::Relaxed);
+            return 0;
+        }
+        for (permit, envelope) in permits.zip(envelopes) {
+            permit.send(envelope);
+        }
+        count
+    }
+
+    fn submit_native(
+        &self,
+        req: agent_transport::proto::SubmitBatchRequest,
+    ) -> agent_transport::proto::SubmitBatchResponse {
+        let total = req.envelopes.len();
+        if total > 1000 {
+            return agent_transport::proto::SubmitBatchResponse {
+                accepted: 0,
+                rejected: total as u32,
+                errors: vec!["batch exceeds 1000 envelopes".into()],
+            };
+        }
+        let mut envelopes = Vec::with_capacity(total);
+        let mut invalid = 0;
+        for env in req.envelopes {
+            // Applications cannot forge inventory, heartbeats or security events.
+            // Dropping all sender identity is intentional: the transport stamps
+            // the enrolled agent's identity when these Rust-native items flush.
+            let signal_type = match env.signal_type {
+                1 => SignalType::Metric,
+                2 => SignalType::Log,
+                3 => SignalType::Trace,
+                4 => SignalType::Event,
+                8 => SignalType::CustomEvent,
+                _ => {
+                    invalid += 1;
+                    continue;
+                }
+            };
+            if env.compression != agent_transport::proto::Compression::None as i32
+                || env.payload.is_empty()
+                || env.payload.len() > 1024 * 1024
+                || env.timestamp_unix_ns <= 0
+            {
+                invalid += 1;
                 continue;
             }
-            match self.envelope_tx.try_send(env) {
-                Ok(()) => {
-                    self.metrics.rate_counter.fetch_add(1, Ordering::Relaxed);
-                    sent += 1;
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
-                    return sent;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => return sent,
-            }
+            envelopes.push(Envelope {
+                signal_type,
+                payload: env.payload,
+                timestamp_unix_ns: env.timestamp_unix_ns,
+                buffered: false,
+                retry_count: 0,
+            });
         }
-        sent
+        let accepted = self.try_send(envelopes);
+        self.metrics.dropped.fetch_add(invalid, Ordering::Relaxed);
+        let rejected = total - accepted;
+        agent_transport::proto::SubmitBatchResponse {
+            accepted: accepted as u32,
+            rejected: rejected as u32,
+            errors: if rejected > 0 {
+                vec![if invalid == 0 {
+                    CAPACITY_REJECTION.into()
+                } else {
+                    "unsupported or malformed native envelope".into()
+                }]
+            } else {
+                vec![]
+            },
+        }
     }
 }
 
@@ -799,23 +878,33 @@ mod grpc_server {
             &self,
             req: hyper::Request<hyper::body::Incoming>,
         ) -> Result<
-            hyper::Response<http_body_util::Full<hyper::body::Bytes>>,
+            hyper::Response<
+                http_body_util::combinators::BoxBody<hyper::body::Bytes, std::convert::Infallible>,
+            >,
             std::convert::Infallible,
         > {
             use http_body_util::BodyExt;
 
             let path = req.uri().path().to_string();
-            let body = match BodyExt::collect(req.into_body()).await {
+            let body = match BodyExt::collect(http_body_util::Limited::new(
+                req.into_body(),
+                MAX_REQUEST_BYTES + 5,
+            ))
+            .await
+            {
                 Ok(b) => b.to_bytes(),
-                Err(_) => hyper::body::Bytes::new(),
+                Err(_) => return Ok(grpc_response(Vec::new(), 8)),
             };
 
-            // Strip gRPC frame header (5 bytes: 1 byte compress flag + 4 bytes length)
-            let payload = if body.len() > 5 {
-                &body[5..]
-            } else {
-                &body[..]
-            };
+            // One uncompressed unary frame, bounded before decoding/allocation.
+            if body.len() < 5
+                || body[0] != 0
+                || u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize
+                    != body.len() - 5
+            {
+                return Ok(grpc_response(Vec::new(), 3));
+            }
+            let payload = &body[5..];
 
             let (response_bytes, status_code) = match path.as_str() {
                 "/opentelemetry.proto.collector.trace.v1.TraceService/Export" => {
@@ -831,9 +920,9 @@ mod grpc_server {
                                 .metrics
                                 .spans_received
                                 .fetch_add(count as u64, Ordering::Relaxed);
-                            self.shared.try_send(envelopes);
+                            let accepted = self.shared.try_send(envelopes);
                             let resp = otlp::ExportTraceServiceResponse::default();
-                            (resp.encode_to_vec(), 0)
+                            (resp.encode_to_vec(), if accepted < count { 8 } else { 0 })
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to decode trace request");
@@ -854,9 +943,9 @@ mod grpc_server {
                                 .metrics
                                 .metrics_received
                                 .fetch_add(count as u64, Ordering::Relaxed);
-                            self.shared.try_send(envelopes);
+                            let accepted = self.shared.try_send(envelopes);
                             let resp = otlp::ExportMetricsServiceResponse::default();
-                            (resp.encode_to_vec(), 0)
+                            (resp.encode_to_vec(), if accepted < count { 8 } else { 0 })
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to decode metrics request");
@@ -877,9 +966,9 @@ mod grpc_server {
                                 .metrics
                                 .logs_received
                                 .fetch_add(count as u64, Ordering::Relaxed);
-                            self.shared.try_send(envelopes);
+                            let accepted = self.shared.try_send(envelopes);
                             let resp = otlp::ExportLogsServiceResponse::default();
-                            (resp.encode_to_vec(), 0)
+                            (resp.encode_to_vec(), if accepted < count { 8 } else { 0 })
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to decode logs request");
@@ -887,26 +976,61 @@ mod grpc_server {
                         }
                     }
                 }
+                "/dodo.proto.v1.IngestorService/SubmitBatch" => {
+                    match agent_transport::proto::SubmitBatchRequest::decode(payload) {
+                        Ok(req) => {
+                            let response = self.shared.submit_native(req);
+                            if response.accepted == 0
+                                && response
+                                    .errors
+                                    .first()
+                                    .is_some_and(|error| error == CAPACITY_REJECTION)
+                            {
+                                (Vec::new(), 8)
+                            } else {
+                                (response.encode_to_vec(), 0)
+                            }
+                        }
+                        Err(_) => (Vec::new(), 3),
+                    }
+                }
                 _ => (Vec::new(), 12), // UNIMPLEMENTED
             };
 
-            // Build gRPC response with frame header
-            let mut frame = Vec::with_capacity(5 + response_bytes.len());
-            frame.push(0u8); // not compressed
-            frame.extend_from_slice(&(response_bytes.len() as u32).to_be_bytes());
-            frame.extend_from_slice(&response_bytes);
-
-            let resp = hyper::Response::builder()
-                .status(200)
-                .header("content-type", "application/grpc")
-                .header("grpc-status", status_code.to_string())
-                .body(http_body_util::Full::new(hyper::body::Bytes::from(frame)))
-                .unwrap_or_else(|_| {
-                    hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new()))
-                });
-
-            Ok(resp)
+            Ok(grpc_response(response_bytes, status_code))
         }
+    }
+
+    fn grpc_response(
+        response_bytes: Vec<u8>,
+        status_code: u16,
+    ) -> hyper::Response<
+        http_body_util::combinators::BoxBody<hyper::body::Bytes, std::convert::Infallible>,
+    > {
+        // Build gRPC response with frame header
+        let mut frame = Vec::with_capacity(5 + response_bytes.len());
+        frame.push(0u8); // not compressed
+        frame.extend_from_slice(&(response_bytes.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&response_bytes);
+
+        use http_body_util::BodyExt;
+        // grpc-status belongs in HTTP/2 trailers after the unary message. A
+        // status header plus DATA is not a trailers-only response and gRPC
+        // clients report "Stream removed" instead of reading the payload.
+        let mut trailers = hyper::HeaderMap::new();
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&status_code.to_string()) {
+            trailers.insert("grpc-status", value);
+        }
+        let body = http_body_util::Full::new(hyper::body::Bytes::from(frame))
+            .with_trailers(async move { Some(Ok(trailers)) })
+            .boxed();
+        let mut resp = hyper::Response::new(body);
+        resp.headers_mut().insert(
+            "content-type",
+            hyper::header::HeaderValue::from_static("application/grpc"),
+        );
+
+        resp
     }
 }
 
@@ -932,9 +1056,13 @@ mod http_server {
         );
 
         let app = axum::Router::new()
+            .route("/v1/batch", axum::routing::post(handle_native))
+            .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .route("/readyz", axum::routing::get(handle_ready))
             .route("/v1/traces", axum::routing::post(handle_traces))
             .route("/v1/metrics", axum::routing::post(handle_metrics))
             .route("/v1/logs", axum::routing::post(handle_logs))
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
             .with_state(shared);
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -946,6 +1074,45 @@ mod http_server {
 
         info!("OTEL HTTP server stopped");
         Ok(())
+    }
+
+    async fn handle_ready(
+        axum::extract::State(shared): axum::extract::State<Arc<OtelShared>>,
+    ) -> axum::http::StatusCode {
+        if shared.envelope_tx.is_closed() || shared.envelope_tx.capacity() == 0 {
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            axum::http::StatusCode::OK
+        }
+    }
+
+    async fn handle_native(
+        axum::extract::State(shared): axum::extract::State<Arc<OtelShared>>,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        if !is_protobuf(&headers) {
+            return axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+        }
+        match agent_transport::proto::SubmitBatchRequest::decode(body) {
+            Ok(req) => {
+                let response = shared.submit_native(req);
+                if response.accepted == 0
+                    && response
+                        .errors
+                        .first()
+                        .is_some_and(|error| error == CAPACITY_REJECTION)
+                {
+                    return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
+                }
+                (
+                    [("content-type", "application/x-protobuf")],
+                    response.encode_to_vec(),
+                )
+                    .into_response()
+            }
+            Err(_) => axum::http::StatusCode::BAD_REQUEST.into_response(),
+        }
     }
 
     async fn handle_traces(
@@ -979,12 +1146,13 @@ mod http_server {
                     .spans_received
                     .fetch_add(count as u64, Ordering::Relaxed);
 
-                if shared.envelope_tx.capacity() == 0 {
-                    return (axum::http::StatusCode::TOO_MANY_REQUESTS, "buffer full")
+                if shared.try_send(envelopes) < count {
+                    return (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        "receiver capacity exceeded",
+                    )
                         .into_response();
                 }
-
-                shared.try_send(envelopes);
                 axum::http::StatusCode::OK.into_response()
             }
             Err(e) => {
@@ -1022,12 +1190,13 @@ mod http_server {
                     .metrics_received
                     .fetch_add(count as u64, Ordering::Relaxed);
 
-                if shared.envelope_tx.capacity() == 0 {
-                    return (axum::http::StatusCode::TOO_MANY_REQUESTS, "buffer full")
+                if shared.try_send(envelopes) < count {
+                    return (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        "receiver capacity exceeded",
+                    )
                         .into_response();
                 }
-
-                shared.try_send(envelopes);
                 axum::http::StatusCode::OK.into_response()
             }
             Err(e) => {
@@ -1065,12 +1234,13 @@ mod http_server {
                     .logs_received
                     .fetch_add(count as u64, Ordering::Relaxed);
 
-                if shared.envelope_tx.capacity() == 0 {
-                    return (axum::http::StatusCode::TOO_MANY_REQUESTS, "buffer full")
+                if shared.try_send(envelopes) < count {
+                    return (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        "receiver capacity exceeded",
+                    )
                         .into_response();
                 }
-
-                shared.try_send(envelopes);
                 axum::http::StatusCode::OK.into_response()
             }
             Err(e) => {
@@ -1304,6 +1474,61 @@ mod tests {
     use super::*;
     use crate::helpers::{log_level, LogPayload, MetricPayload, MetricType};
     use prost::Message;
+
+    fn shared(capacity: usize, rate: u64) -> (OtelShared, mpsc::Receiver<Envelope>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            OtelShared {
+                envelope_tx: tx,
+                metrics: OtelMetrics::new(),
+                rate_limit_per_sec: rate,
+            },
+            rx,
+        )
+    }
+    fn sdk_envelope(signal: i32) -> agent_transport::proto::AgentEnvelope {
+        agent_transport::proto::AgentEnvelope {
+            agent_id: "forged-agent".into(),
+            hostname: "forged-host".into(),
+            signal_type: signal,
+            compression: agent_transport::proto::Compression::None as i32,
+            timestamp_unix_ns: 100,
+            payload: vec![1, 2],
+            buffered: true,
+            retry_count: 99,
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn native_receiver_strips_identity_and_rejects_privileged_signals() {
+        let (shared, mut rx) = shared(10, 10);
+        let result = shared.submit_native(agent_transport::proto::SubmitBatchRequest {
+            envelopes: vec![sdk_envelope(1), sdk_envelope(6)],
+        });
+        assert_eq!((result.accepted, result.rejected), (1, 1));
+        let envelope = rx.try_recv().expect("accepted envelope");
+        assert_eq!(envelope.signal_type, SignalType::Metric);
+        assert!(!envelope.buffered);
+        assert_eq!(envelope.retry_count, 0);
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn admission_rejects_entire_batch_without_partial_duplicates() {
+        let (shared, mut rx) = shared(1, 10);
+        let result = shared.submit_native(agent_transport::proto::SubmitBatchRequest {
+            envelopes: vec![sdk_envelope(1), sdk_envelope(1)],
+        });
+        assert_eq!((result.accepted, result.rejected), (0, 2));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(shared.metrics.dropped.load(Ordering::Relaxed), 2);
+        let (shared, mut rx) = self::shared(10, 1);
+        let result = shared.submit_native(agent_transport::proto::SubmitBatchRequest {
+            envelopes: vec![sdk_envelope(1), sdk_envelope(1)],
+        });
+        assert_eq!((result.accepted, result.rejected), (0, 2));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(shared.metrics.dropped.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn listen_addresses_are_localhost() {

@@ -127,6 +127,7 @@ windows = [
     "redis-collector",
 ]
 lite = [
+    "otel",
     "agent-platform/lite",
     "docker",
     "redis-collector",

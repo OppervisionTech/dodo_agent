@@ -46,7 +46,7 @@ pub struct LocalAgentConfig {
 }
 
 fn default_enrollment_endpoint() -> String {
-    "https://kong.aegisops.io:443/v1/enroll".to_string()
+    String::new()
 }
 
 fn default_endpoint() -> EndpointLocalConfig {
@@ -91,7 +91,7 @@ pub struct EndpointLocalConfig {
 }
 
 fn default_address() -> String {
-    "kong.aegisops.io:443".to_string()
+    "127.0.0.1:50051".to_string()
 }
 fn default_timeout_ms() -> u32 {
     5000
@@ -118,14 +118,24 @@ impl Default for EndpointLocalConfig {
 pub struct TlsLocalConfig {
     #[serde(default = "bool_true")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_ca_cert_path")]
     pub ca_cert_path: String,
-    #[serde(default)]
+    #[serde(default = "default_client_cert_path")]
     pub client_cert_path: String,
-    #[serde(default)]
+    #[serde(default = "default_client_key_path")]
     pub client_key_path: String,
     #[serde(default = "bool_true")]
     pub verify_server: bool,
+}
+
+fn default_ca_cert_path() -> String {
+    "/var/lib/aegis/certs/ca.pem".into()
+}
+fn default_client_cert_path() -> String {
+    "/var/lib/aegis/certs/agent.pem".into()
+}
+fn default_client_key_path() -> String {
+    "/var/lib/aegis/certs/agent-key.pem".into()
 }
 
 fn bool_true() -> bool {
@@ -136,9 +146,9 @@ impl Default for TlsLocalConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            ca_cert_path: "/etc/aegis/certs/ca.pem".to_string(),
-            client_cert_path: "/etc/aegis/certs/agent.pem".to_string(),
-            client_key_path: "/etc/aegis/certs/agent-key.pem".to_string(),
+            ca_cert_path: default_ca_cert_path(),
+            client_cert_path: default_client_cert_path(),
+            client_key_path: default_client_key_path(),
             verify_server: true,
         }
     }
@@ -220,6 +230,12 @@ pub struct CollectorLocalConfig {
 
 fn default_collectors() -> Vec<CollectorLocalConfig> {
     vec![
+        CollectorLocalConfig {
+            name: "otel".into(),
+            enabled: true,
+            interval_seconds: 1,
+            parameters: Default::default(),
+        },
         CollectorLocalConfig {
             name: "cpu".into(),
             enabled: true,

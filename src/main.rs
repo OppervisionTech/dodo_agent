@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     // Load config
     let config_path =
         std::env::var("AEGIS_CONFIG").unwrap_or_else(|_| "/etc/aegis/agent.yaml".to_string());
-    let config = agent_config::loader::load_or_default(&config_path);
+    let config = agent_config::loader::load_or_default(&config_path)?;
 
     // Initialize logging
     init_tracing(&config.logging);
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
         let certs_dir = std::path::Path::new(&config.tls.client_cert_path)
             .parent()
             .and_then(|p| p.to_str())
-            .unwrap_or("/etc/aegis/certs")
+            .unwrap_or("/var/lib/aegis/certs")
             .to_string();
         enroll_with_retry(
             &config.enrollment_endpoint,
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
             &certs_dir,
             &agent_jwt,
         )
-        .await;
+        .await?;
     }
 
     // Spawn batch consumer (transport layer)
@@ -204,12 +204,18 @@ async fn main() -> Result<()> {
     if config.tls.enabled && !config.enrollment_endpoint.is_empty() {
         let refresh_endpoint = config.enrollment_endpoint.clone();
         let refresh_api_key = std::env::var("DODO_API_KEY").unwrap_or_default();
+        let refresh_certs_dir = std::path::Path::new(&config.tls.client_key_path)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("client_key_path has no parent"))?
+            .to_string_lossy()
+            .to_string();
         let refresh_agent_id = agent_state.agent_id.clone();
         let refresh_token = agent_jwt.clone();
         let refresh_cancel = cancel_token.clone();
         tokio::spawn(async move {
             run_token_refresh(
                 refresh_endpoint,
+                refresh_certs_dir,
                 refresh_api_key,
                 refresh_agent_id,
                 refresh_token,
@@ -539,7 +545,7 @@ async fn enroll_with_retry(
     client_cert_path: &str,
     certs_dir: &str,
     token: &agent_transport::SharedToken,
-) {
+) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 6;
     const BASE_BACKOFF_MS: u64 = 2000;
     const MAX_BACKOFF_MS: u64 = 15000;
@@ -556,7 +562,7 @@ async fn enroll_with_retry(
         )
         .await
         {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(e) if attempt < MAX_ATTEMPTS => {
                 let backoff_ms = (BASE_BACKOFF_MS * 2u64.pow(attempt - 1)).min(MAX_BACKOFF_MS);
                 warn!(
@@ -572,11 +578,13 @@ async fn enroll_with_retry(
                 warn!(
                     error = %e,
                     attempt,
-                    "certificate enrollment failed — will retry on next startup"
+                    "certificate enrollment failed — refusing startup"
                 );
+                return Err(e);
             }
         }
     }
+    anyhow::bail!("enrollment exhausted")
 }
 
 /// Keeps `token` populated with a live agent JWT for as long as the agent
@@ -591,6 +599,7 @@ async fn enroll_with_retry(
 /// this loop's first iteration.
 async fn run_token_refresh(
     enrollment_endpoint: String,
+    certs_dir: String,
     api_key: String,
     agent_id: String,
     token: agent_transport::SharedToken,
@@ -608,6 +617,7 @@ async fn run_token_refresh(
             &enrollment_endpoint,
             &api_key,
             &agent_id,
+            &certs_dir,
             &token,
         )
         .await
@@ -644,21 +654,10 @@ async fn run_transport(
         }
     };
 
-    // First, drain any buffered data from previous run
-    if let Some(ref buf) = disk_buffer {
-        if buf.has_data() {
-            info!("draining buffered data from previous run");
-            match buf.drain(500) {
-                Ok(envelopes) if !envelopes.is_empty() => {
-                    info!(count = envelopes.len(), "drained buffered envelopes");
-                    if let Err(e) = grpc_client.submit_batch(envelopes, &agent_state).await {
-                        warn!(error = %e, "failed to send drained buffer data");
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    // Tick immediately at startup, then continue retrying without requiring a
+    // process restart. Peek never removes durable records before an ACK.
+    let mut disk_retry = tokio::time::interval(std::time::Duration::from_secs(5));
+    disk_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -672,10 +671,7 @@ async fn run_transport(
                     match grpc_client.submit_batch(batch.clone(), &agent_state).await {
                         Ok(result) => {
                             drained += result.accepted as u64;
-                            agent_state.envelopes_sent.fetch_add(
-                                result.accepted as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            record_delivery(&agent_state, &result);
                         }
                         Err(e) => {
                             warn!(error = %e, batch_size = batch_size, "shutdown batch send failed, buffering to disk");
@@ -698,14 +694,29 @@ async fn run_transport(
                 grpc_client.disconnect().await;
                 return;
             }
+            _ = disk_retry.tick() => {
+                if let Some(ref buffer) = disk_buffer {
+                    match buffer.peek(500) {
+                        Ok(pending) if !pending.envelopes.is_empty() => {
+                            match grpc_client.submit_batch(pending.envelopes.clone(), &agent_state).await {
+                                Ok(result) => {
+                                    record_delivery(&agent_state, &result);
+                                    if let Err(error) = buffer.acknowledge(&pending) { warn!(error=%error,"disk acknowledgement failed; records remain replayable"); }
+                                    agent_state.buffer_used_bytes.store(buffer.used_bytes(),std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(error) => warn!(error=%error,"disk replay failed; retaining unacknowledged records"),
+                            }
+                        }
+                        Err(error) => warn!(error=%error,"disk replay read failed; retaining records"),
+                        _ => {}
+                    }
+                }
+            }
             Some(batch) = batch_rx.recv() => {
                 let batch_size = batch.len();
                 match grpc_client.submit_batch(batch.clone(), &agent_state).await {
                     Ok(result) => {
-                        agent_state.envelopes_sent.fetch_add(
-                            result.accepted as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        record_delivery(&agent_state, &result);
                     }
                     Err(e) => {
                         warn!(error = %e, batch_size = batch_size, "batch send failed, buffering to disk");
@@ -728,5 +739,21 @@ async fn run_transport(
                 }
             }
         }
+    }
+}
+
+fn record_delivery(state: &agent_core::AgentState, result: &agent_transport::SubmitResult) {
+    state
+        .envelopes_sent
+        .fetch_add(result.accepted as u64, std::sync::atomic::Ordering::Relaxed);
+    state
+        .envelopes_failed
+        .fetch_add(result.rejected as u64, std::sync::atomic::Ordering::Relaxed);
+    if result.rejected > 0 {
+        warn!(
+            accepted = result.accepted,
+            rejected = result.rejected,
+            "upstream rejected acknowledged envelopes; not retrying accepted subset"
+        );
     }
 }

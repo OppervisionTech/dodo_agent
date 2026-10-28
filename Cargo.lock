@@ -29,6 +29,7 @@ dependencies = [
  "agent-core",
  "agent-ebpf",
  "agent-platform",
+ "agent-transport",
  "anyhow",
  "axum",
  "glob",
@@ -138,10 +139,12 @@ version = "0.1.0"
 dependencies = [
  "agent-core",
  "anyhow",
+ "base64",
  "http",
  "prost",
  "rcgen",
  "reqwest",
+ "ring",
  "rustls-pemfile",
  "serde",
  "serde_json",
@@ -150,6 +153,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "uuid",
  "x509-parser",
 ]
 

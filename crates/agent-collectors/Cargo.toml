@@ -15,6 +15,7 @@ redis-collector = []
 
 [dependencies]
 agent-core = { workspace = true }
+agent-transport = { workspace = true }
 agent-platform = { workspace = true }
 agent-ebpf = { workspace = true, optional = true }
 tokio = { workspace = true }

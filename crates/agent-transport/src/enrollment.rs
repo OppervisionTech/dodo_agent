@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, PKCS_ECDSA_P256_SHA256};
+use rcgen::{
+    Certificate, CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256,
+};
 use std::io::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::info;
@@ -59,9 +61,12 @@ struct RefreshResponse {
 
 /// Generates an ECDSA P-256 key pair and a CSR with CN=agent_id.
 /// Returns (key_pem, csr_pem).
-fn generate_csr(agent_id: &str) -> Result<(String, String)> {
+fn generate_csr(agent_id: &str, existing_key: Option<&str>) -> Result<(String, String)> {
     let mut params = CertificateParams::default();
     params.alg = &PKCS_ECDSA_P256_SHA256;
+    if let Some(key) = existing_key {
+        params.key_pair = Some(KeyPair::from_pem(key).context("loading enrolled private key")?);
+    }
 
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, agent_id);
@@ -77,34 +82,41 @@ fn generate_csr(agent_id: &str) -> Result<(String, String)> {
 
 /// Writes CA cert, agent cert, and private key to `certs_dir`.
 /// The private key file is created with mode 0600 on Unix.
-fn write_certs(ca_pem: &str, cert_pem: &str, key_pem: &str, certs_dir: &str) -> Result<()> {
-    std::fs::create_dir_all(certs_dir)
-        .with_context(|| format!("creating certs directory {certs_dir}"))?;
-
-    std::fs::write(format!("{certs_dir}/ca.pem"), ca_pem.as_bytes()).context("writing ca.pem")?;
-    std::fs::write(format!("{certs_dir}/agent.pem"), cert_pem.as_bytes())
-        .context("writing agent.pem")?;
-
+fn write_private_file(path: &str, bytes: &[u8]) -> Result<()> {
+    let path = std::path::Path::new(path);
+    let parent = path.parent().context("state file requires parent")?;
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
     {
-        #[cfg(unix)]
-        let mut f = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(format!("{certs_dir}/agent-key.pem"))
-                .context("creating agent-key.pem")?
-        };
-        #[cfg(not(unix))]
-        let mut f = std::fs::File::create(format!("{certs_dir}/agent-key.pem"))
-            .context("creating agent-key.pem")?;
-
-        f.write_all(key_pem.as_bytes())
-            .context("writing agent-key.pem")?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
+    let tmp = parent.join(format!(
+        ".state-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
 
+fn write_certs(ca_pem: &str, cert_pem: &str, key_pem: &str, certs_dir: &str) -> Result<()> {
+    // Key is stable across renewals; readers never observe a truncated file.
+    write_private_file(&format!("{certs_dir}/agent-key.pem"), key_pem.as_bytes())?;
+    write_private_file(&format!("{certs_dir}/ca.pem"), ca_pem.as_bytes())?;
+    write_private_file(&format!("{certs_dir}/agent.pem"), cert_pem.as_bytes())?;
     Ok(())
 }
 
@@ -130,6 +142,9 @@ pub async fn enroll_if_needed(
     }
 
     if !cert_needs_renewal(client_cert_path) {
+        // JWT lives only in memory. Warm restarts must refresh before starting
+        // transport even though their long-lived certificate is still valid.
+        refresh_token(enrollment_endpoint, api_key, agent_id, certs_dir, token).await?;
         return Ok(());
     }
 
@@ -138,9 +153,21 @@ pub async fn enroll_if_needed(
         "certificates missing or expiring — starting enrollment"
     );
 
-    let (key_pem, csr_pem) = generate_csr(agent_id).context("generating CSR")?;
+    let key_path = format!("{certs_dir}/agent-key.pem");
+    let existing_key = match std::fs::read_to_string(&key_path) {
+        Ok(key) => Some(key),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).context("reading enrolled private key"),
+    };
+    let (key_pem, csr_pem) =
+        generate_csr(agent_id, existing_key.as_deref()).context("generating CSR")?;
+    // Persist before the request: retries after a crash must prove the same key.
+    if existing_key.is_none() {
+        write_private_file(&key_path, key_pem.as_bytes())?;
+    }
 
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .build()
         .context("building enrollment HTTP client")?;
@@ -159,8 +186,7 @@ pub async fn enroll_if_needed(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("enrollment endpoint returned {status}: {body}");
+        bail!("enrollment endpoint returned {status}");
     }
 
     let enroll: EnrollResponse = resp.json().await.context("decoding enrollment response")?;
@@ -208,13 +234,38 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(45 * 60);
 /// site is `main.rs`'s periodic refresh task.
 ///
 /// Returns how long the caller should wait before refreshing again.
+fn refresh_proof(agent_id: &str, certs_dir: &str) -> Result<(String, u64, String)> {
+    use base64::Engine as _;
+    let key_pem = std::fs::read_to_string(format!("{certs_dir}/agent-key.pem"))
+        .context("reading refresh identity key")?;
+    let (_, csr_pem) = generate_csr(agent_id, Some(&key_pem))?;
+    let mut cursor = std::io::Cursor::new(key_pem.as_bytes());
+    let der = rustls_pemfile::private_key(&mut cursor)?.context("missing PKCS8 private key")?;
+    let rng = ring::rand::SystemRandom::new();
+    let key = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        der.secret_der(),
+        &rng,
+    )
+    .map_err(|_| anyhow::anyhow!("invalid P256 identity key"))?;
+    let proof_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let message = format!("dodo-token-refresh\n{agent_id}\n{proof_timestamp}");
+    let signature = key
+        .sign(&rng, message.as_bytes())
+        .map_err(|_| anyhow::anyhow!("signing refresh proof failed"))?;
+    let proof_signature = base64::engine::general_purpose::STANDARD.encode(signature.as_ref());
+    Ok((csr_pem, proof_timestamp, proof_signature))
+}
+
 pub async fn refresh_token(
     enrollment_endpoint: &str,
     api_key: &str,
     agent_id: &str,
+    certs_dir: &str,
     token: &crate::SharedToken,
 ) -> Result<Duration> {
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .build()
         .context("building token refresh HTTP client")?;
@@ -222,20 +273,28 @@ pub async fn refresh_token(
     #[derive(serde::Serialize)]
     struct RefreshRequest<'a> {
         agent_id: &'a str,
+        csr_pem: String,
+        proof_timestamp: u64,
+        proof_signature: String,
     }
+    let (csr_pem, proof_timestamp, proof_signature) = refresh_proof(agent_id, certs_dir)?;
 
     let resp = client
         .post(refresh_endpoint(enrollment_endpoint))
         .bearer_auth(api_key)
-        .json(&RefreshRequest { agent_id })
+        .json(&RefreshRequest {
+            agent_id,
+            csr_pem,
+            proof_timestamp,
+            proof_signature,
+        })
         .send()
         .await
         .context("sending token refresh request")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("token refresh endpoint returned {status}: {body}");
+        bail!("token refresh endpoint returned {status}");
     }
 
     let refreshed: RefreshResponse = resp.json().await.context("decoding refresh response")?;
@@ -250,6 +309,58 @@ pub async fn refresh_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewal_keeps_private_key_and_refresh_proves_possession() {
+        use base64::Engine as _;
+        let dir = std::env::temp_dir().join(format!("dodo-proof-{}", uuid::Uuid::new_v4()));
+        let (key, _) = generate_csr("test-agent", None).expect("key");
+        write_private_file(
+            dir.join("agent-key.pem").to_str().expect("path"),
+            key.as_bytes(),
+        )
+        .expect("persist key");
+        let (renewed_key, _) = generate_csr("test-agent", Some(&key)).expect("renewal CSR");
+        assert_eq!(key, renewed_key);
+        let (_, timestamp, signature) =
+            refresh_proof("test-agent", dir.to_str().expect("dir")).expect("proof");
+        let pair = KeyPair::from_pem(&key).expect("parse key");
+        let verifier = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            pair.public_key_raw(),
+        );
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(signature)
+            .expect("base64");
+        let message = format!("dodo-token-refresh\ntest-agent\n{timestamp}");
+        verifier
+            .verify(message.as_bytes(), &signature)
+            .expect("valid proof");
+        assert!(verifier
+            .verify(b"dodo-token-refresh\nother-agent\n0", &signature)
+            .is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.join("agent-key.pem"))
+                    .expect("key metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&dir)
+                    .expect("dir metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
 
     /// The ingestor's enrollment handler reads `host_id` from the request
     /// body to populate agents.host_id (the stable cross-reinstall identity
