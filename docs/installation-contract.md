@@ -83,3 +83,14 @@ once: a crash after upstream acceptance but before local ACK may replay a duplic
 An explicit rejection is counted as failed and is not retried as a partial batch.
 Corrupt local records remain on disk for diagnosis. Native capacity errors return
 ResourceExhausted/HTTP429; SDKs report drops if their retry budget is exhausted.
+
+## Staging bundle preparation
+Push to staging now triggers the existing image build. A staging-only dependent
+job extracts Linux amd64 ELF bytes from that exact image digest, verifies the OCI
+revision against the source SHA and uploads a run-scoped Actions artifact with
+archive, installer and checksums. It does not create a tag/release or publish a
+customer manifest. `distribution-candidate.json` deliberately has
+`manifestReady=false`: this repository is private and the canonical installer
+still requires versioned GitHub assets. An approved, tested Dodo download channel
+is required before exposing installation instructions. Existing registry/access
+visibility is unchanged.

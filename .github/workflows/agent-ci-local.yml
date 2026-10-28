@@ -28,10 +28,14 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Installer and release archive contracts
         run: |
           bash tests/test-installer.sh
           python3 tests/test-release-contract.py
+          python3 tests/test-staging-bundle.py
 
   clippy:
     name: Clippy Lint

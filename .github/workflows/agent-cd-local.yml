@@ -2,7 +2,7 @@ name: Agent CD (local)
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, staging]
   workflow_dispatch:
     inputs:
       environment:
@@ -131,3 +131,49 @@ jobs:
           name: coverage-staging-${{ github.sha }}
           path: coverage/
           retention-days: 30
+
+  staging-bundle:
+    name: Prepare immutable staging bundle
+    if: github.ref == 'refs/heads/staging' && (github.event.inputs.environment || 'staging') == 'staging'
+    needs: build-push
+    runs-on: [self-hosted, local]
+    environment: staging
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract binary from the exact staging image
+        env:
+          IMAGE: ghcr.io/oppervisiontech/aegis-agent@${{ needs.build-push.outputs.image-digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          container_id="$(docker create "$IMAGE")"
+          trap 'docker rm -f "$container_id" >/dev/null' EXIT
+          docker cp "$container_id:/usr/local/bin/aegis-agent" "$RUNNER_TEMP/aegis-agent"
+          revision="$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+          python3 scripts/build-staging-bundle.py \
+            --binary "$RUNNER_TEMP/aegis-agent" --source-sha "$GITHUB_SHA" \
+            --image "$IMAGE" --image-revision "$revision" --run-id "$GITHUB_RUN_ID" \
+            --output "dist/staging-bundle-$GITHUB_SHA-$GITHUB_RUN_ID"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-staging-${{ github.sha }}-${{ github.run_id }}
+          path: dist/staging-bundle-${{ github.sha }}-${{ github.run_id }}/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record distribution readiness
+        run: |
+          echo 'Staging bundle built from the pinned image; no tag, release or production registry published by this job.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'manifestReady=false: approve and test a customer-accessible download channel before configuring the portal.' >> "$GITHUB_STEP_SUMMARY"
