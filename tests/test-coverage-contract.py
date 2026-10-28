@@ -30,6 +30,17 @@ class CoverageContractTests(unittest.TestCase):
                 result = subprocess.run([sys.executable, str(ROOT/'scripts/check-coverage.py'), str(report)], capture_output=True)
                 self.assertEqual(result.returncode == 0, succeeds)
 
+    def test_cd_reporting_mode_uses_same_parser_without_adding_a_new_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / 'tarpaulin.log'
+            command = [sys.executable, str(ROOT/'scripts/check-coverage.py'), '--print-percentage', str(report)]
+            report.write_text('79.99% coverage, 7999/10000 lines covered\n')
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.strip(), '79.99')
+            report.write_text('missing summary\n')
+            self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

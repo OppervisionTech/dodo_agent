@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Check the existing 80% gate against the real Tarpaulin summary."""
 from decimal import Decimal
+import argparse
 import os
 from pathlib import Path
 import re
-import sys
 
 MINIMUM = Decimal('80')
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
@@ -32,4 +32,12 @@ def main(filename):
 
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('filename')
+    parser.add_argument('--print-percentage', action='store_true',
+                        help='parse the CD report without changing its reporting-only policy')
+    args = parser.parse_args()
+    if args.print_percentage:
+        print(coverage_percent(Path(args.filename).read_text()))
+    else:
+        main(args.filename)
