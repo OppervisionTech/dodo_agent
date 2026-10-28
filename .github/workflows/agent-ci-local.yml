@@ -28,9 +28,15 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
+          version: '0.13.6'
           python-version: '3.12'
+      - name: Prepare portable Python
+        run: |
+          python_env="${RUNNER_TEMP}/dodo-agent-python-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          uv venv "$python_env" --python 3.12
+          echo "$python_env/bin" >> "$GITHUB_PATH"
       - name: Installer and release archive contracts
         run: |
           bash tests/test-installer.sh
@@ -81,9 +87,15 @@ jobs:
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin --locked
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
+          version: '0.13.6'
           python-version: '3.12'
+      - name: Prepare portable Python
+        run: |
+          python_env="${RUNNER_TEMP}/dodo-agent-python-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          uv venv "$python_env" --python 3.12
+          echo "$python_env/bin" >> "$GITHUB_PATH"
 
       - name: Run coverage
         run: |
