@@ -36,6 +36,7 @@ jobs:
           bash tests/test-installer.sh
           python3 tests/test-release-contract.py
           python3 tests/test-staging-bundle.py
+          python3 tests/test-coverage-contract.py
 
   clippy:
     name: Clippy Lint
@@ -80,25 +81,25 @@ jobs:
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin --locked
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Run coverage
         run: |
+          set -euo pipefail
+          mkdir -p coverage
           cargo tarpaulin \
             --features linux \
             --workspace \
-            --out Html Lcov Json \
+            --out Html Lcov Json Stdout \
+            --fail-under 80 \
             --output-dir coverage/ \
             --timeout 120 \
-            --exclude-files "*/target/*" "*/tests/*"
+            --exclude-files "*/target/*" "*/tests/*" | tee coverage/tarpaulin.log
 
       - name: Check coverage threshold
-        run: |
-          COVERAGE=$(cargo tarpaulin --features linux --workspace --out Stdout 2>/dev/null \
-            | grep -oP '[\d.]+(?= % coverage)' | tail -1 || echo "0")
-          echo "### Coverage: ${COVERAGE}%" >> "$GITHUB_STEP_SUMMARY"
-          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
-            echo "Coverage ${COVERAGE}% is below 80% threshold" >&2
-            exit 1
-          fi
+        run: python3 scripts/check-coverage.py coverage/tarpaulin.log
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
