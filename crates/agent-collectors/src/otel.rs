@@ -436,20 +436,25 @@ impl OtelShared {
                 return 0;
             }
         };
-        if self
-            .metrics
-            .rate_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current
-                    .checked_add(count as u64)
-                    .filter(|next| *next <= self.rate_limit_per_sec)
-            })
-            .is_err()
-        {
-            self.metrics
-                .dropped
-                .fetch_add(count as u64, Ordering::Relaxed);
-            return 0;
+        // Keep the atomic reservation compatible with the declared MSRV as
+        // newer Rust versions rename fetch_update to try_update.
+        let counter = &self.metrics.rate_counter;
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current
+                .checked_add(count as u64)
+                .filter(|next| *next <= self.rate_limit_per_sec)
+            else {
+                self.metrics
+                    .dropped
+                    .fetch_add(count as u64, Ordering::Relaxed);
+                return 0;
+            };
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
         for (permit, envelope) in permits.zip(envelopes) {
             permit.send(envelope);
@@ -1528,6 +1533,45 @@ mod tests {
         assert_eq!((result.accepted, result.rejected), (0, 2));
         assert!(rx.try_recv().is_err());
         assert_eq!(shared.metrics.dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn concurrent_admission_never_exceeds_rate_and_rejects_overflow() {
+        let (shared, mut rx) = shared(100, 10);
+        let barrier = std::sync::Barrier::new(16);
+        let accepted: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        shared
+                            .submit_native(agent_transport::proto::SubmitBatchRequest {
+                                envelopes: vec![sdk_envelope(1), sdk_envelope(1)],
+                            })
+                            .accepted as usize
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!(accepted, 10);
+        assert_eq!(shared.metrics.rate_counter.load(Ordering::Relaxed), 10);
+        assert_eq!(shared.metrics.dropped.load(Ordering::Relaxed), 22);
+        assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).count(), 10);
+
+        shared
+            .metrics
+            .rate_counter
+            .store(u64::MAX, Ordering::Relaxed);
+        let result = shared.submit_native(agent_transport::proto::SubmitBatchRequest {
+            envelopes: vec![sdk_envelope(1)],
+        });
+        assert_eq!((result.accepted, result.rejected), (0, 1));
+        assert_eq!(
+            shared.metrics.rate_counter.load(Ordering::Relaxed),
+            u64::MAX
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
