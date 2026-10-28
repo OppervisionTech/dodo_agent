@@ -24,26 +24,31 @@ jobs:
           - variant: linux
             arch: amd64
             target: x86_64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent
             pkg: tar
           - variant: linux
             arch: arm64
             target: aarch64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent
             pkg: tar
           - variant: lite
             arch: amd64
             target: x86_64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent-lite
             pkg: tar
           - variant: lite
             arch: arm64
             target: aarch64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent-lite
             pkg: tar
           - variant: windows
             arch: amd64
             target: x86_64-pc-windows-gnu
+            source_binary: aegis-agent.exe
             binary: aegis-agent.exe
             pkg: zip
     steps:
@@ -71,17 +76,17 @@ jobs:
 
       - name: Build (native amd64)
         if: matrix.arch == 'amd64'
-        run: cargo build --release --features ${{ matrix.variant }} --target ${{ matrix.target }}
+        run: cargo build --release --locked --no-default-features --features ${{ matrix.variant }} --target ${{ matrix.target }}
 
       - name: Build (cross arm64)
         if: matrix.arch == 'arm64'
-        run: cross build --release --features ${{ matrix.variant }} --target ${{ matrix.target }}
+        run: cross build --release --locked --no-default-features --features ${{ matrix.variant }} --target ${{ matrix.target }}
 
       - name: Package binary (tar)
         if: matrix.pkg == 'tar'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.binary }}
+          cp target/${{ matrix.target }}/release/${{ matrix.source_binary }} dist/${{ matrix.binary }}
           cd dist
           sha256sum ${{ matrix.binary }} > ${{ matrix.binary }}.sha256
           tar -czf aegis-agent-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz ${{ matrix.binary }}
@@ -91,7 +96,7 @@ jobs:
         if: matrix.pkg == 'zip'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.binary }}
+          cp target/${{ matrix.target }}/release/${{ matrix.source_binary }} dist/${{ matrix.binary }}
           cd dist
           sha256sum ${{ matrix.binary }} > ${{ matrix.binary }}.sha256
           zip aegis-agent-${{ matrix.variant }}-${{ matrix.arch }}.zip ${{ matrix.binary }}

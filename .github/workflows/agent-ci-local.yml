@@ -1,29 +1,41 @@
-name: Agent CI (local)
+name: Agent CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, staging]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, staging]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
+  CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
   fmt:
     name: Format Check
-    runs-on: [self-hosted, local]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      - name: Installer and release archive contracts
+        run: |
+          bash tests/test-installer.sh
+          python3 tests/test-release-contract.py
 
   clippy:
     name: Clippy Lint
-    runs-on: [self-hosted, local]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         feature: [linux, windows, lite]
@@ -42,7 +54,7 @@ jobs:
 
   test:
     name: Tests
-    runs-on: [self-hosted, local]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,7 +63,7 @@ jobs:
 
   coverage:
     name: Code Coverage
-    runs-on: [self-hosted, local]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -100,7 +112,7 @@ jobs:
 
   build:
     name: Build Variants
-    runs-on: [self-hosted, local]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
@@ -125,7 +137,7 @@ jobs:
 
   security:
     name: Security Audit
-    runs-on: [self-hosted, local]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
