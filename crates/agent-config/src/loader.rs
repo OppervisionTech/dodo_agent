@@ -169,6 +169,59 @@ pub fn config_hash(config: &LocalAgentConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_addresses_state_layout_and_invalid_runtime_limits_fail_validation() {
+        type InvalidCase = (&'static str, fn(&mut LocalAgentConfig));
+        let cases: [InvalidCase; 14] = [
+            ("empty address", |c| c.endpoint.address = String::new()),
+            ("URL instead of authority", |c| {
+                c.endpoint.address = "https://localhost:443".into()
+            }),
+            ("path in authority", |c| {
+                c.endpoint.address = "localhost:443/path".into()
+            }),
+            ("invalid port", |c| {
+                c.endpoint.address = "localhost:0".into()
+            }),
+            ("empty host", |c| c.endpoint.address = ":443".into()),
+            ("credentials in enrollment URL", |c| {
+                c.enrollment_endpoint = "https://user@example.test/v1/enroll".into()
+            }),
+            ("noncanonical certificate layout", |c| {
+                c.enrollment_endpoint = "https://example.test/v1/enroll".into();
+                c.tls.client_key_path = "relative/key.pem".into();
+            }),
+            ("zero enabled collector interval", |c| {
+                c.collectors[0].interval_seconds = 0
+            }),
+            ("undersized buffer", |c| c.buffer.max_size_bytes = 1),
+            ("zero flush interval", |c| c.buffer.flush_interval_ms = 0),
+            ("zero batch size", |c| c.buffer.max_batch_size = 0),
+            ("zero upstream timeout", |c| c.endpoint.timeout_ms = 0),
+            ("invalid log level", |c| c.logging.level = "invalid".into()),
+            ("invalid redaction regex", |c| {
+                c.redaction_patterns = vec!["[".into()]
+            }),
+        ];
+        for (label, mutate) in cases {
+            let mut config = LocalAgentConfig::default();
+            mutate(&mut config);
+            assert!(validate(&config).is_err(), "{label}");
+        }
+        let mut config = LocalAgentConfig::default();
+        config.endpoint.address = "[::1]:65535".into();
+        config.tls.enabled = false;
+        config.buffer.max_size_bytes = 1024 * 1024;
+        config.buffer.flush_interval_ms = 1;
+        config.buffer.max_batch_size = 1;
+        validate(&config).unwrap();
+        let before = config_hash(&config);
+        assert_eq!(before.len(), 64);
+        assert_eq!(config_hash(&config), before);
+        config.logging.level = "debug".into();
+        assert_ne!(config_hash(&config), before);
+    }
     #[test]
     fn malformed_existing_config_never_falls_back() {
         let path = std::env::temp_dir().join(format!("dodo-bad-{}.yaml", std::process::id()));

@@ -79,13 +79,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: coverage
 
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin --locked
+        run: cargo install cargo-tarpaulin --version 0.37.5 --locked
 
       - uses: astral-sh/setup-uv@v5
         with:
@@ -102,8 +104,10 @@ jobs:
           set -euo pipefail
           mkdir -p coverage
           cargo tarpaulin \
+            --engine llvm \
             --features linux \
             --workspace \
+            --follow-exec \
             --out Html Lcov Json Stdout \
             --fail-under 80 \
             --output-dir coverage/ \
@@ -114,6 +118,7 @@ jobs:
         run: python3 scripts/check-coverage.py coverage/tarpaulin.log
 
       - name: Upload coverage report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report

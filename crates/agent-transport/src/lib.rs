@@ -14,7 +14,7 @@ pub enum TransportError {
     #[error("TLS error: {0}")]
     Tls(String),
     #[error("gRPC error: {code} - {message}")]
-    Grpc { code: String, message: String },
+    Grpc { code: tonic::Code, message: String },
     #[error("timeout after {0}ms")]
     Timeout(u32),
     #[error("buffer error: {0}")]
@@ -115,5 +115,57 @@ impl Default for TransportConfig {
             api_key: None,
             agent_jwt: SharedToken::default(),
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/support/network.rs"]
+mod test_network;
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn every_request_observes_the_current_identity_and_active_key() {
+        let config = TransportConfig {
+            api_key: Some("synthetic-key".into()),
+            ..Default::default()
+        };
+        *config.agent_jwt.write().unwrap() = Some("first-token".into());
+        let mut request = tonic::Request::new(());
+        attach_auth_metadata(&mut request, &config);
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            "Bearer first-token"
+        );
+        assert_eq!(
+            request.metadata().get("x-api-key").unwrap(),
+            "synthetic-key"
+        );
+        *config.agent_jwt.write().unwrap() = Some("refreshed-token".into());
+        let mut request = tonic::Request::new(());
+        attach_auth_metadata(&mut request, &config.clone());
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            "Bearer refreshed-token"
+        );
+    }
+
+    #[test]
+    fn malformed_headers_cannot_inject_metadata() {
+        let config = TransportConfig {
+            api_key: Some("key\r\nx-other: injected".into()),
+            ..Default::default()
+        };
+        *config.agent_jwt.write().unwrap() = Some("token\ninvalid".into());
+        let mut request = tonic::Request::new(());
+        attach_auth_metadata(&mut request, &config);
+        assert!(request.metadata().is_empty());
+        let mut config = config;
+        config.api_key = Some(String::new());
+        *config.agent_jwt.write().unwrap() = None;
+        attach_auth_metadata(&mut request, &config);
+        assert!(request.metadata().is_empty());
     }
 }

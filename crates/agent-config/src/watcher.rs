@@ -9,6 +9,71 @@ pub struct ConfigWatcher {
     current_hash: String,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_only_publishes_valid_changes_and_stops_when_cancelled() {
+        let path = std::env::temp_dir().join(format!(
+            "dodo-watcher-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let file = Fixture(path);
+        let mut config = LocalAgentConfig::default();
+        std::fs::write(&file.0, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let initial = loader::config_hash(&config);
+        let mut watcher = ConfigWatcher::new(file.0.to_str().unwrap().into(), 1, initial.clone());
+        let (tx, mut rx) = tokio::sync::watch::channel(config.clone());
+        watcher.check_for_changes(&tx).await;
+        assert!(!rx.has_changed().unwrap());
+        config.logging.level = "debug".into();
+        std::fs::write(&file.0, serde_yaml::to_string(&config).unwrap()).unwrap();
+        watcher.check_for_changes(&tx).await;
+        rx.changed().await.unwrap();
+        assert_eq!(rx.borrow_and_update().logging.level, "debug");
+        let valid_hash = watcher.current_hash.clone();
+        assert_ne!(valid_hash, initial);
+        std::fs::write(&file.0, "collectors: {broken: true}").unwrap();
+        watcher.check_for_changes(&tx).await;
+        assert_eq!(watcher.current_hash, valid_hash);
+        assert!(!rx.has_changed().unwrap());
+        std::fs::write(&file.0, serde_yaml::to_string(&config).unwrap()).unwrap();
+        drop(rx);
+        config.logging.level = "error".into();
+        std::fs::write(&file.0, serde_yaml::to_string(&config).unwrap()).unwrap();
+        watcher.check_for_changes(&tx).await;
+        for interval in [0, 1] {
+            let mut watcher =
+                ConfigWatcher::new(file.0.to_str().unwrap().into(), interval, String::new());
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                watcher.run(tx.clone(), cancel),
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
 impl ConfigWatcher {
     pub fn new(
         local_config_path: String,

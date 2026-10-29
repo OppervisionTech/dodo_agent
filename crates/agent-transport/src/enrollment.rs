@@ -311,6 +311,162 @@ mod tests {
     use super::*;
 
     #[test]
+    fn certificate_renewal_checks_missing_corrupt_expired_and_valid_state() {
+        let directory = crate::test_network::Directory::new();
+        let path = directory.0.join("agent.pem");
+        assert!(cert_needs_renewal(path.to_str().unwrap()));
+        for invalid in [
+            "not a certificate",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(cert_needs_renewal(path.to_str().unwrap()));
+        }
+        let mut params = CertificateParams::default();
+        params.not_after = rcgen::date_time_ymd(2000, 1, 1);
+        let expired = Certificate::from_params(params).unwrap();
+        std::fs::write(&path, expired.serialize_pem().unwrap()).unwrap();
+        assert!(cert_needs_renewal(path.to_str().unwrap()));
+        let valid = Certificate::from_params(CertificateParams::default()).unwrap();
+        std::fs::write(&path, valid.serialize_pem().unwrap()).unwrap();
+        assert!(!cert_needs_renewal(path.to_str().unwrap()));
+        assert_eq!(
+            refresh_endpoint("https://example.test/"),
+            "https://example.test/v1/token/refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_http_enrollment_then_warm_restart_refresh_preserves_identity() {
+        let directory = crate::test_network::Directory::new();
+        let cert = Certificate::from_params(CertificateParams::default())
+            .unwrap()
+            .serialize_pem()
+            .unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let response_cert = cert.clone();
+        let server = crate::test_network::http(move |request| {
+            assert_eq!(request.headers()["authorization"], "Bearer synthetic-key");
+            let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+            captured
+                .lock()
+                .unwrap()
+                .push((request.uri().path().to_string(), body));
+            let response = if request.uri().path() == "/v1/enroll" {
+                serde_json::json!({"ca_cert_pem":response_cert,"agent_cert_pem":response_cert,
+                    "expires_at":"future", "agent_jwt":"enrolled-token"})
+            } else {
+                serde_json::json!({"agent_jwt":"refreshed-token", "agent_jwt_expires_at":"future"})
+            };
+            (200, serde_json::to_vec(&response).unwrap())
+        })
+        .await;
+        let endpoint = format!("http://{}/v1/enroll", server.address);
+        let path = directory.0.join("certs/agent.pem");
+        let certs = directory.0.join("certs");
+        let token = crate::SharedToken::default();
+        enroll_if_needed(
+            &endpoint,
+            "synthetic-key",
+            "agent",
+            "host",
+            path.to_str().unwrap(),
+            certs.to_str().unwrap(),
+            &token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(token.read().unwrap().as_deref(), Some("enrolled-token"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), cert);
+        let original_key = std::fs::read_to_string(certs.join("agent-key.pem")).unwrap();
+        *token.write().unwrap() = None;
+        enroll_if_needed(
+            &endpoint,
+            "synthetic-key",
+            "agent",
+            "host",
+            path.to_str().unwrap(),
+            certs.to_str().unwrap(),
+            &token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(token.read().unwrap().as_deref(), Some("refreshed-token"));
+        assert_eq!(
+            std::fs::read_to_string(certs.join("agent-key.pem")).unwrap(),
+            original_key
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, "/v1/enroll");
+        assert_eq!(requests[0].1["host_id"], "host");
+        assert_eq!(requests[1].0, "/v1/token/refresh");
+        assert_eq!(requests[1].1["agent_id"], "agent");
+        assert!(requests[1].1["proof_timestamp"].as_u64().unwrap() > 0);
+        assert!(!requests[1].1["proof_signature"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_or_malformed_responses_never_replace_certificates_or_tokens() {
+        for (status, body) in [
+            (401, "unauthorized"),
+            (302, "redirect"),
+            (200, "invalid json"),
+        ] {
+            let directory = crate::test_network::Directory::new();
+            let server =
+                crate::test_network::http(move |_| (status, body.as_bytes().to_vec())).await;
+            let endpoint = format!("http://{}/v1/enroll", server.address);
+            let certs = directory.0.to_str().unwrap();
+            let path = directory.0.join("agent.pem");
+            let token = crate::SharedToken::default();
+            *token.write().unwrap() = Some("original-token".into());
+            assert!(enroll_if_needed(
+                &endpoint,
+                "synthetic-key",
+                "agent",
+                "host",
+                path.to_str().unwrap(),
+                certs,
+                &token
+            )
+            .await
+            .is_err());
+            assert!(!path.exists());
+            let key = std::fs::read_to_string(directory.0.join("agent-key.pem")).unwrap();
+            assert!(enroll_if_needed(
+                &endpoint,
+                "synthetic-key",
+                "agent",
+                "host",
+                path.to_str().unwrap(),
+                certs,
+                &token
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                std::fs::read_to_string(directory.0.join("agent-key.pem")).unwrap(),
+                key
+            );
+            assert!(
+                refresh_token(&endpoint, "synthetic-key", "agent", certs, &token)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(token.read().unwrap().as_deref(), Some("original-token"));
+        }
+        let token = crate::SharedToken::default();
+        enroll_if_needed("", "", "agent", "host", "/not-read", "/not-created", &token)
+            .await
+            .unwrap();
+    }
+
+    #[test]
     fn renewal_keeps_private_key_and_refresh_proves_possession() {
         use base64::Engine as _;
         let dir = std::env::temp_dir().join(format!("dodo-proof-{}", uuid::Uuid::new_v4()));

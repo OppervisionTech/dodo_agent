@@ -461,8 +461,8 @@ impl Platform for LinuxPlatform {
             }
 
             let block_size = filesystem_count(stat.f_frsize);
-            let total_bytes = (stat.f_blocks as u64) * block_size;
-            let free_bytes = (stat.f_bfree as u64) * block_size;
+            let total_bytes = filesystem_count(stat.f_blocks) * block_size;
+            let free_bytes = filesystem_count(stat.f_bfree) * block_size;
             let used_bytes = total_bytes.saturating_sub(free_bytes);
 
             // Skip zero-size filesystems
@@ -477,8 +477,9 @@ impl Platform for LinuxPlatform {
                 total_bytes,
                 used_bytes,
                 free_bytes,
-                inodes_total: stat.f_files as u64,
-                inodes_used: (stat.f_files as u64).saturating_sub(stat.f_ffree as u64),
+                inodes_total: filesystem_count(stat.f_files),
+                inodes_used: filesystem_count(stat.f_files)
+                    .saturating_sub(filesystem_count(stat.f_ffree)),
             });
         }
 
