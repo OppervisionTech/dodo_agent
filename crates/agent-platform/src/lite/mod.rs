@@ -713,7 +713,7 @@ fn build_platform_info() -> PlatformResult<PlatformInfo> {
         .trim()
         .to_string();
 
-    let machine_id = resolve_machine_id(FALLBACK_HOST_ID_PATH);
+    let machine_id = resolve_machine_id(FALLBACK_HOST_ID_PATH)?;
 
     let os_version = read_string("/etc/os-release")
         .map(|c| {

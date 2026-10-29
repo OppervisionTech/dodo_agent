@@ -1,6 +1,6 @@
 use crate::*;
 
-use crate::common::{resolve_machine_id_from_paths, FALLBACK_HOST_ID_PATH};
+use crate::common::{resolve_machine_id_from_paths, FALLBACK_HOST_ID_PATH, LEGACY_HOST_ID_PATH};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -237,7 +237,8 @@ impl Platform for LinuxPlatform {
             self.path(FALLBACK_HOST_ID_PATH)
                 .to_str()
                 .ok_or_else(|| PlatformError::Parse("host-id path is not UTF-8".to_string()))?,
-        );
+            Some(&self.path(LEGACY_HOST_ID_PATH)),
+        )?;
 
         let cpuinfo = fs::read_to_string(self.path("/proc/cpuinfo")).map_err(PlatformError::Io)?;
         let cpu_count_logical = cpuinfo

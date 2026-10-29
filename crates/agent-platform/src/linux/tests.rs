@@ -541,3 +541,46 @@ fn cloud_provider_fallbacks_validate_headers_and_accept_standard_json_whitespace
     f.command("curl", "exit 1");
     assert!(f.platform.cloud_info().unwrap().is_none());
 }
+
+#[test]
+fn fallback_identity_uses_persistent_state_migrates_legacy_and_fails_on_unwritable_state() {
+    let f = Fixture::new();
+    f.host();
+    fs::remove_file(f.platform.path("/etc/machine-id")).unwrap();
+    f.write(LEGACY_HOST_ID_PATH, "legacy-host-id\n");
+    assert_eq!(f.platform.info().unwrap().machine_id, "legacy-host-id");
+    let state = f.platform.path(FALLBACK_HOST_ID_PATH);
+    assert!(state.starts_with(f.platform.path("/var/lib/aegis")));
+    assert_eq!(fs::read_to_string(&state).unwrap(), "legacy-host-id");
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    fs::remove_file(f.platform.path(LEGACY_HOST_ID_PATH)).unwrap();
+    assert_eq!(f.platform.info().unwrap().machine_id, "legacy-host-id");
+    fs::write(&state, "").unwrap();
+    assert!(
+        f.platform.info().is_err(),
+        "empty identity must not silently rotate"
+    );
+    fs::remove_file(&state).unwrap();
+    fs::remove_dir(f.platform.path("/var/lib/aegis")).unwrap();
+    f.write("/var/lib/aegis", "not a writable state directory");
+    assert!(matches!(f.platform.info(), Err(PlatformError::Io(_))));
+}
+
+#[test]
+fn unreadable_or_corrupt_legacy_state_never_silently_rotates_the_host() {
+    let f = Fixture::new();
+    f.host();
+    fs::remove_file(f.platform.path("/etc/machine-id")).unwrap();
+    f.directory(LEGACY_HOST_ID_PATH);
+    assert!(matches!(f.platform.info(), Err(PlatformError::Io(_))));
+    assert!(!f.platform.path(FALLBACK_HOST_ID_PATH).exists());
+    fs::remove_dir(f.platform.path(LEGACY_HOST_ID_PATH)).unwrap();
+    f.write(LEGACY_HOST_ID_PATH, "");
+    assert!(matches!(f.platform.info(), Err(PlatformError::Parse(_))));
+    fs::write(f.platform.path(LEGACY_HOST_ID_PATH), [0xff, 0xfe]).unwrap();
+    assert!(matches!(f.platform.info(), Err(PlatformError::Io(_))));
+    assert!(!f.platform.path(FALLBACK_HOST_ID_PATH).exists());
+}
