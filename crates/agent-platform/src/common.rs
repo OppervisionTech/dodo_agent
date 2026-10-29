@@ -50,7 +50,20 @@ pub const FALLBACK_HOST_ID_PATH: &str = "/var/lib/aegis-agent/host-id";
 /// host missing both standard files would otherwise collide under the same
 /// id, defeating host-level dedup server-side rather than merely degrading it.
 pub fn resolve_machine_id(fallback_path: &str) -> String {
-    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+    resolve_machine_id_from_paths(
+        [
+            std::path::PathBuf::from("/etc/machine-id"),
+            std::path::PathBuf::from("/var/lib/dbus/machine-id"),
+        ],
+        fallback_path,
+    )
+}
+
+pub(crate) fn resolve_machine_id_from_paths(
+    paths: [std::path::PathBuf; 2],
+    fallback_path: &str,
+) -> String {
+    for path in paths {
         if let Ok(id) = std::fs::read_to_string(path) {
             let id = id.trim().to_string();
             if !id.is_empty() {
