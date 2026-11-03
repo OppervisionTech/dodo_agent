@@ -6,6 +6,59 @@ fn load_pem_bytes(path: &str, label: &str) -> TransportResult<Vec<u8>> {
         .map_err(|e| TransportError::Tls(format!("cannot read {label} from {path}: {e}")))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_or_invalid_tls_material_and_endpoints_fail_closed() {
+        let directory = crate::test_network::Directory::new();
+        let mut config = TransportConfig {
+            endpoint_address: "127.0.0.1:1".into(),
+            ca_cert_path: directory.0.join("missing.pem").to_str().unwrap().into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            build_grpc_channel(&config).await,
+            Err(TransportError::Tls(_))
+        ));
+        let cert = rcgen::Certificate::from_params(rcgen::CertificateParams::default()).unwrap();
+        let path = directory.0.join("ca.pem");
+        std::fs::write(&path, cert.serialize_pem().unwrap()).unwrap();
+        config.ca_cert_path = path.to_str().unwrap().into();
+        config.client_cert_path = path.to_str().unwrap().into();
+        config.client_key_path = directory.0.join("missing-key.pem").to_str().unwrap().into();
+        assert!(matches!(
+            build_grpc_channel(&config).await,
+            Err(TransportError::Tls(_))
+        ));
+        let key = directory.0.join("key.pem");
+        std::fs::write(&key, cert.serialize_private_key_pem()).unwrap();
+        config.client_key_path = key.to_str().unwrap().into();
+        config.timeout_ms = 0;
+        let result = build_grpc_channel(&config).await;
+        assert!(
+            matches!(result, Err(TransportError::Connection(_))),
+            "{result:?}"
+        );
+        config.endpoint_address = "not a valid authority".into();
+        assert!(matches!(
+            build_grpc_channel(&config).await,
+            Err(TransportError::Connection(_))
+        ));
+        config.tls_enabled = false;
+        assert!(matches!(
+            build_grpc_channel(&config).await,
+            Err(TransportError::Connection(_))
+        ));
+        config.endpoint_address = "127.0.0.1:1".into();
+        assert!(matches!(
+            build_grpc_channel(&config).await,
+            Err(TransportError::Connection(_))
+        ));
+    }
+}
+
 /// Build a tonic Channel for connecting to the ingestor.
 ///
 /// When TLS is enabled (production), uses mTLS with PEM certificates.

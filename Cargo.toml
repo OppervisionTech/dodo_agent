@@ -41,8 +41,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Compression
-zstd = "0.13"
+# Wire transport currently uses Compression::None; do not link the unused zstd codec.
 lz4_flex = "0.11"
 
 # Crypto
@@ -127,6 +126,7 @@ windows = [
     "redis-collector",
 ]
 lite = [
+    "otel",
     "agent-platform/lite",
     "docker",
     "redis-collector",
@@ -151,3 +151,11 @@ serde_json = { workspace = true }
 [[bin]]
 name = "aegis-agent"
 path = "src/main.rs"
+
+[dev-dependencies]
+h2 = "0.4"
+http = "1"
+libc = "0.2"
+prost = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

@@ -20,6 +20,10 @@ rcgen = { workspace = true }
 x509-parser = { workspace = true }
 rustls-pemfile = { workspace = true }
 http = "1"
+ring = "0.17"
+base64 = "0.22"
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+h2 = "0.4"

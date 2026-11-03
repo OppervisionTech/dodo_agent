@@ -1,21 +1,45 @@
 use crate::*;
 
-use crate::common::{resolve_machine_id, FALLBACK_HOST_ID_PATH};
+use crate::common::{resolve_machine_id_from_paths, FALLBACK_HOST_ID_PATH, LEGACY_HOST_ID_PATH};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
+
+// statvfs field widths differ across libc targets; normalize without assuming
+// that the native counter is always u64.
+fn filesystem_count(value: impl Into<u64>) -> u64 {
+    value.into()
+}
 
 /// Linux-specific implementation of the Platform trait.
 ///
 /// Reads system information directly from /proc and /sys filesystems.
 /// No external crates are used for procfs parsing — all parsing is manual.
-pub struct LinuxPlatform;
+pub struct LinuxPlatform {
+    root: PathBuf,
+    command_dir: Option<PathBuf>,
+}
 
 impl LinuxPlatform {
     pub fn new() -> Self {
-        Self
+        Self {
+            root: PathBuf::from("/"),
+            command_dir: None,
+        }
+    }
+
+    fn path(&self, path: &str) -> PathBuf {
+        self.root.join(path.trim_start_matches('/'))
+    }
+
+    fn command(&self, program: &str) -> Command {
+        match &self.command_dir {
+            Some(directory) => Command::new(directory.join(program)),
+            None => Command::new(program),
+        }
     }
 
     /// Parse a key-value file like /proc/meminfo where lines are "Key: value kB".
@@ -42,9 +66,9 @@ impl LinuxPlatform {
     }
 
     /// Read the uid-to-username mapping from /etc/passwd.
-    fn uid_to_username_map() -> HashMap<u32, String> {
+    fn uid_to_username_map(&self) -> HashMap<u32, String> {
         let mut map = HashMap::new();
-        if let Ok(content) = fs::read_to_string("/etc/passwd") {
+        if let Ok(content) = fs::read_to_string(self.path("/etc/passwd")) {
             for line in content.lines() {
                 let fields: Vec<&str> = line.split(':').collect();
                 if fields.len() >= 3 {
@@ -76,27 +100,29 @@ impl LinuxPlatform {
             let d = (addr_u32 >> 24) & 0xFF;
             Some((format!("{}.{}.{}.{}", a, b, c, d), port))
         } else if addr_hex.len() == 32 {
-            // IPv6: stored as 4 little-endian 32-bit words
-            let ip = format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}",
-                &addr_hex[6..8],
-                &addr_hex[4..6],
-                &addr_hex[2..4],
-                &addr_hex[0..2],
-                &addr_hex[14..16],
-                &addr_hex[12..14],
-                &addr_hex[10..12],
-                &addr_hex[8..10],
-            );
-            Some((ip, port))
+            // procfs encodes all four 32-bit words in native little-endian order.
+            // Reject non-ASCII data before slicing byte offsets.
+            if !addr_hex.is_ascii() {
+                return None;
+            }
+            let mut octets = [0_u8; 16];
+            for (word, output) in addr_hex
+                .as_bytes()
+                .chunks_exact(8)
+                .zip(octets.chunks_exact_mut(4))
+            {
+                let encoded = std::str::from_utf8(word).ok()?;
+                output.copy_from_slice(&u32::from_str_radix(encoded, 16).ok()?.to_le_bytes());
+            }
+            Some((std::net::Ipv6Addr::from(octets).to_string(), port))
         } else {
             None
         }
     }
 
     /// Find the PID that owns a given inode from /proc/[pid]/fd.
-    fn find_pid_for_inode(inode: u64) -> Option<(u32, String)> {
-        let proc_dir = match fs::read_dir("/proc") {
+    fn find_pid_for_inode(&self, inode: u64) -> Option<(u32, String)> {
+        let proc_dir = match fs::read_dir(self.path("/proc")) {
             Ok(d) => d,
             Err(_) => return None,
         };
@@ -110,7 +136,7 @@ impl LinuxPlatform {
             };
 
             let fd_path = format!("/proc/{}/fd", pid);
-            let fd_dir = match fs::read_dir(&fd_path) {
+            let fd_dir = match fs::read_dir(self.path(&fd_path)) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
@@ -118,11 +144,12 @@ impl LinuxPlatform {
             for fd_entry in fd_dir.flatten() {
                 if let Ok(link) = fs::read_link(fd_entry.path()) {
                     let link_str = link.to_string_lossy().to_string();
-                    if link_str.contains(&format!("socket:[{}]", inode)) {
-                        let proc_name = fs::read_to_string(format!("/proc/{}/comm", pid))
-                            .unwrap_or_default()
-                            .trim()
-                            .to_string();
+                    if link_str == format!("socket:[{}]", inode) {
+                        let proc_name =
+                            fs::read_to_string(self.path(&format!("/proc/{}/comm", pid)))
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
                         return Some((pid, proc_name));
                     }
                 }
@@ -171,15 +198,15 @@ impl Default for LinuxPlatform {
 
 impl Platform for LinuxPlatform {
     fn info(&self) -> PlatformResult<PlatformInfo> {
-        let hostname = fs::read_to_string("/proc/sys/kernel/hostname")
+        let hostname = fs::read_to_string(self.path("/proc/sys/kernel/hostname"))
             .map(|s| s.trim().to_string())
             .map_err(PlatformError::Io)?;
 
-        let kernel_version = fs::read_to_string("/proc/sys/kernel/osrelease")
+        let kernel_version = fs::read_to_string(self.path("/proc/sys/kernel/osrelease"))
             .map(|s| s.trim().to_string())
             .map_err(PlatformError::Io)?;
 
-        let os_version = fs::read_to_string("/etc/os-release")
+        let os_version = fs::read_to_string(self.path("/etc/os-release"))
             .ok()
             .and_then(|content| {
                 content
@@ -193,29 +220,39 @@ impl Platform for LinuxPlatform {
             })
             .unwrap_or_else(|| "Linux".to_string());
 
-        let architecture = fs::read_to_string("/proc/sys/kernel/arch")
+        let architecture = fs::read_to_string(self.path("/proc/sys/kernel/arch"))
             .or_else(|_| {
-                Command::new("uname")
+                self.command("uname")
                     .arg("-m")
                     .output()
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             })
             .unwrap_or_else(|_| "unknown".to_string());
 
-        let machine_id = resolve_machine_id(FALLBACK_HOST_ID_PATH);
+        let machine_id = resolve_machine_id_from_paths(
+            [
+                self.path("/etc/machine-id"),
+                self.path("/var/lib/dbus/machine-id"),
+            ],
+            self.path(FALLBACK_HOST_ID_PATH)
+                .to_str()
+                .ok_or_else(|| PlatformError::Parse("host-id path is not UTF-8".to_string()))?,
+            Some(&self.path(LEGACY_HOST_ID_PATH)),
+        )?;
 
-        let cpuinfo = fs::read_to_string("/proc/cpuinfo").map_err(PlatformError::Io)?;
+        let cpuinfo = fs::read_to_string(self.path("/proc/cpuinfo")).map_err(PlatformError::Io)?;
         let cpu_count_logical = cpuinfo
             .lines()
             .filter(|l| l.starts_with("processor"))
             .count() as u32;
         let cpu_count_physical = Self::count_physical_cores(&cpuinfo);
 
-        let meminfo = fs::read_to_string("/proc/meminfo").map_err(PlatformError::Io)?;
+        let meminfo = fs::read_to_string(self.path("/proc/meminfo")).map_err(PlatformError::Io)?;
         let mem_map = Self::parse_kv_file(&meminfo);
         let total_memory_bytes = mem_map.get("MemTotal").copied().unwrap_or(0) * 1024;
 
-        let stat_content = fs::read_to_string("/proc/stat").map_err(PlatformError::Io)?;
+        let stat_content =
+            fs::read_to_string(self.path("/proc/stat")).map_err(PlatformError::Io)?;
         let boot_time_unix = stat_content
             .lines()
             .find(|l| l.starts_with("btime "))
@@ -238,7 +275,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn capabilities(&self) -> PlatformResult<PlatformCapabilities> {
-        let kernel_version = fs::read_to_string("/proc/sys/kernel/osrelease")
+        let kernel_version = fs::read_to_string(self.path("/proc/sys/kernel/osrelease"))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "0.0".to_string());
         let (major, minor) = Self::parse_kernel_version(&kernel_version);
@@ -247,8 +284,8 @@ impl Platform for LinuxPlatform {
         let ebpf_available = major > 5 || (major == 5 && minor >= 8);
 
         // Container detection: check /.dockerenv or cgroup contents
-        let container_detected = std::path::Path::new("/.dockerenv").exists()
-            || fs::read_to_string("/proc/1/cgroup")
+        let container_detected = self.path("/.dockerenv").exists()
+            || fs::read_to_string(self.path("/proc/1/cgroup"))
                 .map(|c| {
                     c.contains("/docker/")
                         || c.contains("/kubepods/")
@@ -258,7 +295,7 @@ impl Platform for LinuxPlatform {
                 .unwrap_or(false);
 
         // Cloud detection: quick check via DMI or product info
-        let cloud_detected = fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+        let cloud_detected = fs::read_to_string(self.path("/sys/class/dmi/id/sys_vendor"))
             .map(|v| {
                 let v = v.trim().to_lowercase();
                 v.contains("amazon") || v.contains("google") || v.contains("microsoft")
@@ -275,7 +312,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn cpu_times(&self) -> PlatformResult<Vec<CpuTimes>> {
-        let content = fs::read_to_string("/proc/stat").map_err(PlatformError::Io)?;
+        let content = fs::read_to_string(self.path("/proc/stat")).map_err(PlatformError::Io)?;
         let mut result = Vec::new();
 
         for line in content.lines() {
@@ -316,7 +353,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn load_average(&self) -> PlatformResult<LoadAverage> {
-        let content = fs::read_to_string("/proc/loadavg").map_err(PlatformError::Io)?;
+        let content = fs::read_to_string(self.path("/proc/loadavg")).map_err(PlatformError::Io)?;
         let fields: Vec<&str> = content.split_whitespace().collect();
 
         if fields.len() < 3 {
@@ -339,7 +376,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn memory_info(&self) -> PlatformResult<MemoryInfo> {
-        let content = fs::read_to_string("/proc/meminfo").map_err(PlatformError::Io)?;
+        let content = fs::read_to_string(self.path("/proc/meminfo")).map_err(PlatformError::Io)?;
         let kv = Self::parse_kv_file(&content);
 
         let get_kb = |key: &str| -> u64 { kv.get(key).copied().unwrap_or(0) * 1024 };
@@ -374,7 +411,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn disk_spaces(&self) -> PlatformResult<Vec<DiskSpace>> {
-        let mounts = fs::read_to_string("/proc/mounts").map_err(PlatformError::Io)?;
+        let mounts = fs::read_to_string(self.path("/proc/mounts")).map_err(PlatformError::Io)?;
         let mut result = Vec::new();
         let mut seen_devices: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -403,7 +440,7 @@ impl Platform for LinuxPlatform {
                 continue;
             }
 
-            let c_path = match CString::new(mount_point) {
+            let c_path = match CString::new(self.path(mount_point).as_os_str().as_encoded_bytes()) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -423,9 +460,9 @@ impl Platform for LinuxPlatform {
                 continue;
             }
 
-            let block_size = stat.f_frsize as u64;
-            let total_bytes = (stat.f_blocks as u64) * block_size;
-            let free_bytes = (stat.f_bfree as u64) * block_size;
+            let block_size = filesystem_count(stat.f_frsize);
+            let total_bytes = filesystem_count(stat.f_blocks) * block_size;
+            let free_bytes = filesystem_count(stat.f_bfree) * block_size;
             let used_bytes = total_bytes.saturating_sub(free_bytes);
 
             // Skip zero-size filesystems
@@ -440,8 +477,9 @@ impl Platform for LinuxPlatform {
                 total_bytes,
                 used_bytes,
                 free_bytes,
-                inodes_total: stat.f_files as u64,
-                inodes_used: (stat.f_files as u64).saturating_sub(stat.f_ffree as u64),
+                inodes_total: filesystem_count(stat.f_files),
+                inodes_used: filesystem_count(stat.f_files)
+                    .saturating_sub(filesystem_count(stat.f_ffree)),
             });
         }
 
@@ -449,7 +487,8 @@ impl Platform for LinuxPlatform {
     }
 
     fn disk_io(&self) -> PlatformResult<Vec<DiskIo>> {
-        let content = fs::read_to_string("/proc/diskstats").map_err(PlatformError::Io)?;
+        let content =
+            fs::read_to_string(self.path("/proc/diskstats")).map_err(PlatformError::Io)?;
         let mut result = Vec::new();
 
         for line in content.lines() {
@@ -524,7 +563,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn network_counters(&self) -> PlatformResult<Vec<NetworkCounters>> {
-        let content = fs::read_to_string("/proc/net/dev").map_err(PlatformError::Io)?;
+        let content = fs::read_to_string(self.path("/proc/net/dev")).map_err(PlatformError::Io)?;
         let mut result = Vec::new();
 
         for line in content.lines().skip(2) {
@@ -579,7 +618,7 @@ impl Platform for LinuxPlatform {
 
         // Parse both IPv4 and IPv6 TCP connections
         for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
-            let content = match fs::read_to_string(path) {
+            let content = match fs::read_to_string(self.path(path)) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -614,11 +653,11 @@ impl Platform for LinuxPlatform {
     }
 
     fn processes(&self) -> PlatformResult<Vec<ProcessInfo>> {
-        let proc_dir = fs::read_dir("/proc").map_err(PlatformError::Io)?;
-        let uid_map = Self::uid_to_username_map();
+        let proc_dir = fs::read_dir(self.path("/proc")).map_err(PlatformError::Io)?;
+        let uid_map = self.uid_to_username_map();
 
         // Read total memory once for memory_percent calculation
-        let total_memory = fs::read_to_string("/proc/meminfo")
+        let total_memory = fs::read_to_string(self.path("/proc/meminfo"))
             .ok()
             .and_then(|c| {
                 Self::parse_kv_file(&c)
@@ -640,7 +679,7 @@ impl Platform for LinuxPlatform {
 
             // Read /proc/[pid]/stat
             let stat_path = format!("/proc/{}/stat", pid);
-            let stat_content = match fs::read_to_string(&stat_path) {
+            let stat_content = match fs::read_to_string(self.path(&stat_path)) {
                 Ok(c) => c,
                 Err(_) => continue, // process may have exited
             };
@@ -656,8 +695,14 @@ impl Platform for LinuxPlatform {
                 None => continue,
             };
 
-            let process_name = stat_content[comm_start + 1..comm_end].to_string();
-            let after_comm = &stat_content[comm_end + 2..]; // skip ") "
+            let Some(process_name) = stat_content.get(comm_start + 1..comm_end) else {
+                continue;
+            };
+            let process_name = process_name.to_string();
+            let after_comm = stat_content
+                .get(comm_end + 1..)
+                .unwrap_or_default()
+                .trim_start();
             let stat_fields: Vec<&str> = after_comm.split_whitespace().collect();
 
             if stat_fields.is_empty() {
@@ -687,7 +732,7 @@ impl Platform for LinuxPlatform {
 
             // Read UID from /proc/[pid]/status
             let status_path = format!("/proc/{}/status", pid);
-            let uid = fs::read_to_string(&status_path)
+            let uid = fs::read_to_string(self.path(&status_path))
                 .ok()
                 .and_then(|content| {
                     content
@@ -705,13 +750,13 @@ impl Platform for LinuxPlatform {
 
             // Read open file descriptors count
             let fd_path = format!("/proc/{}/fd", pid);
-            let open_fds = fs::read_dir(&fd_path)
+            let open_fds = fs::read_dir(self.path(&fd_path))
                 .map(|entries| entries.count() as i64)
                 .unwrap_or(-1);
 
             // Read command line
             let cmdline_path = format!("/proc/{}/cmdline", pid);
-            let cmdline = fs::read_to_string(&cmdline_path)
+            let cmdline = fs::read_to_string(self.path(&cmdline_path))
                 .map(|c| c.replace('\0', " ").trim().to_string())
                 .unwrap_or_default();
 
@@ -736,7 +781,7 @@ impl Platform for LinuxPlatform {
         let mut result = Vec::new();
 
         for (path, protocol) in &[("/proc/net/tcp", "tcp"), ("/proc/net/tcp6", "tcp6")] {
-            let content = match fs::read_to_string(path) {
+            let content = match fs::read_to_string(self.path(path)) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -769,7 +814,7 @@ impl Platform for LinuxPlatform {
                 };
 
                 let (pid, process_name) =
-                    Self::find_pid_for_inode(inode).unwrap_or((0, String::new()));
+                    self.find_pid_for_inode(inode).unwrap_or((0, String::new()));
 
                 result.push(ListeningPort {
                     port,
@@ -785,7 +830,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn network_interfaces(&self) -> PlatformResult<Vec<NetworkInterface>> {
-        let sys_net = fs::read_dir("/sys/class/net").map_err(PlatformError::Io)?;
+        let sys_net = fs::read_dir(self.path("/sys/class/net")).map_err(PlatformError::Io)?;
         let mut result = Vec::new();
 
         for entry in sys_net.flatten() {
@@ -798,7 +843,7 @@ impl Platform for LinuxPlatform {
 
             // Check operstate — skip interfaces that are down
             let operstate_path = format!("/sys/class/net/{}/operstate", name);
-            let operstate = fs::read_to_string(&operstate_path)
+            let operstate = fs::read_to_string(self.path(&operstate_path))
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
 
@@ -808,13 +853,13 @@ impl Platform for LinuxPlatform {
 
             // MAC address
             let mac_path = format!("/sys/class/net/{}/address", name);
-            let mac = fs::read_to_string(&mac_path)
+            let mac = fs::read_to_string(self.path(&mac_path))
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
 
             // MTU
             let mtu_path = format!("/sys/class/net/{}/mtu", name);
-            let mtu = fs::read_to_string(&mtu_path)
+            let mtu = fs::read_to_string(self.path(&mtu_path))
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(0);
@@ -824,7 +869,8 @@ impl Platform for LinuxPlatform {
             let mut ipv6 = Vec::new();
 
             // Read IPv4 from /proc/net/fib_trie is complex; use ip command as fallback
-            if let Ok(output) = Command::new("ip")
+            if let Ok(output) = self
+                .command("ip")
                 .args(["-4", "addr", "show", &name])
                 .output()
             {
@@ -841,7 +887,8 @@ impl Platform for LinuxPlatform {
                 }
             }
 
-            if let Ok(output) = Command::new("ip")
+            if let Ok(output) = self
+                .command("ip")
                 .args(["-6", "addr", "show", &name])
                 .output()
             {
@@ -879,17 +926,17 @@ impl Platform for LinuxPlatform {
         // provider, we return None gracefully.
 
         // AWS IMDSv2
-        if let Some(info) = Self::try_aws_imdsv2() {
+        if let Some(info) = self.try_aws_imdsv2() {
             return Ok(Some(info));
         }
 
         // GCP metadata
-        if let Some(info) = Self::try_gcp_metadata() {
+        if let Some(info) = self.try_gcp_metadata() {
             return Ok(Some(info));
         }
 
         // Azure IMDS
-        if let Some(info) = Self::try_azure_imds() {
+        if let Some(info) = self.try_azure_imds() {
             return Ok(Some(info));
         }
 
@@ -900,7 +947,8 @@ impl Platform for LinuxPlatform {
         let mut result = Vec::new();
 
         // Try dpkg (Debian/Ubuntu)
-        if let Ok(output) = Command::new("dpkg-query")
+        if let Ok(output) = self
+            .command("dpkg-query")
             .args(["-W", "-f", "${Package}\t${Version}\n"])
             .output()
         {
@@ -923,7 +971,8 @@ impl Platform for LinuxPlatform {
         }
 
         // Try rpm (RHEL/CentOS/Fedora)
-        if let Ok(output) = Command::new("rpm")
+        if let Ok(output) = self
+            .command("rpm")
             .args(["-qa", "--queryformat", "%{NAME}\t%{VERSION}-%{RELEASE}\n"])
             .output()
         {
@@ -946,7 +995,7 @@ impl Platform for LinuxPlatform {
         }
 
         // Try apk (Alpine)
-        if let Ok(output) = Command::new("apk").args(["list", "--installed"]).output() {
+        if let Ok(output) = self.command("apk").args(["list", "--installed"]).output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
@@ -972,7 +1021,8 @@ impl Platform for LinuxPlatform {
     fn services(&self) -> PlatformResult<Vec<ServiceInfo>> {
         let mut result = Vec::new();
 
-        let output = match Command::new("systemctl")
+        let output = match self
+            .command("systemctl")
             .args([
                 "list-units",
                 "--type=service",
@@ -1003,7 +1053,8 @@ impl Platform for LinuxPlatform {
             let status = format!("{}/{}", active, sub);
 
             // Check if enabled
-            let enabled = Command::new("systemctl")
+            let enabled = self
+                .command("systemctl")
                 .args(["is-enabled", fields[0]])
                 .output()
                 .map(|o| {
@@ -1025,10 +1076,10 @@ impl Platform for LinuxPlatform {
 
     fn users(&self) -> PlatformResult<Vec<UserInfo>> {
         // Read /etc/passwd — NEVER read /etc/shadow
-        let content = fs::read_to_string("/etc/passwd").map_err(PlatformError::Io)?;
+        let content = fs::read_to_string(self.path("/etc/passwd")).map_err(PlatformError::Io)?;
 
         // Read group file to build gid-to-group mapping and user-to-groups mapping
-        let group_content = fs::read_to_string("/etc/group").unwrap_or_default();
+        let group_content = fs::read_to_string(self.path("/etc/group")).unwrap_or_default();
         let mut gid_to_group: HashMap<u32, String> = HashMap::new();
         let mut user_groups: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -1101,7 +1152,7 @@ impl Platform for LinuxPlatform {
     fn cgroup_cpu(&self) -> PlatformResult<Option<CgroupCpuInfo>> {
         // Read cgroup v2 cpu.max and cpu.stat
         // cpu.max format: "$MAX $PERIOD" or "max $PERIOD"
-        let cpu_max = match fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let cpu_max = match fs::read_to_string(self.path("/sys/fs/cgroup/cpu.max")) {
             Ok(c) => c,
             Err(_) => return Ok(None), // cgroup v2 not available
         };
@@ -1125,7 +1176,7 @@ impl Platform for LinuxPlatform {
         };
 
         // Read usage from cpu.stat
-        let usage_ns = fs::read_to_string("/sys/fs/cgroup/cpu.stat")
+        let usage_ns = fs::read_to_string(self.path("/sys/fs/cgroup/cpu.stat"))
             .ok()
             .and_then(|content| {
                 content
@@ -1146,7 +1197,7 @@ impl Platform for LinuxPlatform {
 
     fn cgroup_memory(&self) -> PlatformResult<Option<CgroupMemoryInfo>> {
         // Read cgroup v2 memory.max and memory.current
-        let memory_max_str = match fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let memory_max_str = match fs::read_to_string(self.path("/sys/fs/cgroup/memory.max")) {
             Ok(c) => c.trim().to_string(),
             Err(_) => return Ok(None), // cgroup v2 not available
         };
@@ -1158,7 +1209,7 @@ impl Platform for LinuxPlatform {
             0
         };
 
-        let usage_bytes = fs::read_to_string("/sys/fs/cgroup/memory.current")
+        let usage_bytes = fs::read_to_string(self.path("/sys/fs/cgroup/memory.current"))
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
@@ -1187,9 +1238,10 @@ impl Platform for LinuxPlatform {
 
 impl LinuxPlatform {
     /// Try AWS IMDSv2: first get a session token, then query instance metadata.
-    fn try_aws_imdsv2() -> Option<CloudInfo> {
+    fn try_aws_imdsv2(&self) -> Option<CloudInfo> {
         // Step 1: Get IMDSv2 token
-        let token_output = Command::new("curl")
+        let token_output = self
+            .command("curl")
             .args([
                 "-s",
                 "--max-time",
@@ -1215,7 +1267,7 @@ impl LinuxPlatform {
         }
 
         let fetch = |path: &str| -> String {
-            Command::new("curl")
+            self.command("curl")
                 .args([
                     "-s",
                     "--max-time",
@@ -1250,9 +1302,9 @@ impl LinuxPlatform {
     }
 
     /// Try GCP metadata server.
-    fn try_gcp_metadata() -> Option<CloudInfo> {
+    fn try_gcp_metadata(&self) -> Option<CloudInfo> {
         let fetch = |path: &str| -> Option<String> {
-            Command::new("curl")
+            self.command("curl")
                 .args([
                     "-s",
                     "--max-time",
@@ -1296,8 +1348,9 @@ impl LinuxPlatform {
     }
 
     /// Try Azure IMDS.
-    fn try_azure_imds() -> Option<CloudInfo> {
-        let output = Command::new("curl")
+    fn try_azure_imds(&self) -> Option<CloudInfo> {
+        let output = self
+            .command("curl")
             .args([
                 "-s",
                 "--max-time",
@@ -1315,16 +1368,12 @@ impl LinuxPlatform {
 
         let body = String::from_utf8_lossy(&output.stdout).to_string();
 
-        // Simple JSON parsing without serde_json dependency (extract known fields)
+        let body: serde_json::Value = serde_json::from_str(&body).ok()?;
         let extract = |key: &str| -> String {
-            let search = format!("\"{}\":\"", key);
-            body.find(&search)
-                .map(|start| {
-                    let value_start = start + search.len();
-                    let value_end = body[value_start..].find('"').unwrap_or(0) + value_start;
-                    body[value_start..value_end].to_string()
-                })
+            body.get(key)
+                .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
+                .to_string()
         };
 
         let vm_id = extract("vmId");
@@ -1341,3 +1390,6 @@ impl LinuxPlatform {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

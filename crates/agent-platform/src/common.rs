@@ -41,7 +41,8 @@ pub fn is_pseudo_filesystem(fs_type: &str) -> bool {
 /// [`resolve_machine_id`]). Deliberately distinct from the agent_id path
 /// (config-driven, `main.rs::load_or_create_agent_id`) — one identifies
 /// "which agent install", the other "which physical host".
-pub const FALLBACK_HOST_ID_PATH: &str = "/var/lib/aegis-agent/host-id";
+pub const FALLBACK_HOST_ID_PATH: &str = "/var/lib/aegis/host-id";
+pub(crate) const LEGACY_HOST_ID_PATH: &str = "/var/lib/aegis-agent/host-id";
 
 /// Resolves a stable machine identity: `/etc/machine-id`, then
 /// `/var/lib/dbus/machine-id`, then a UUID generated once and persisted to
@@ -49,37 +50,89 @@ pub const FALLBACK_HOST_ID_PATH: &str = "/var/lib/aegis-agent/host-id";
 /// systemd/D-Bus. Deliberately never returns a literal `"unknown"` — every
 /// host missing both standard files would otherwise collide under the same
 /// id, defeating host-level dedup server-side rather than merely degrading it.
-pub fn resolve_machine_id(fallback_path: &str) -> String {
-    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
-        if let Ok(id) = std::fs::read_to_string(path) {
-            let id = id.trim().to_string();
-            if !id.is_empty() {
-                return id;
-            }
-        }
-    }
-
-    read_or_generate_persisted(fallback_path)
+pub fn resolve_machine_id(fallback_path: &str) -> PlatformResult<String> {
+    resolve_machine_id_from_paths(
+        [
+            std::path::PathBuf::from("/etc/machine-id"),
+            std::path::PathBuf::from("/var/lib/dbus/machine-id"),
+        ],
+        fallback_path,
+        Some(std::path::Path::new(LEGACY_HOST_ID_PATH)),
+    )
 }
 
-/// Reads an id from `path` if present and non-empty; otherwise generates a
-/// UUID, persists it to `path`, and returns it. Split out from
-/// [`resolve_machine_id`] specifically so this tier is unit-testable without
-/// depending on the real host's `/etc/machine-id` being absent.
-fn read_or_generate_persisted(path: &str) -> String {
-    if let Ok(id) = std::fs::read_to_string(path) {
-        let id = id.trim().to_string();
-        if !id.is_empty() {
-            return id;
+pub(crate) fn resolve_machine_id_from_paths(
+    paths: [std::path::PathBuf; 2],
+    fallback_path: &str,
+    legacy_path: Option<&std::path::Path>,
+) -> PlatformResult<String> {
+    for path in paths {
+        if let Some(id) = read_identity(&path) {
+            return Ok(id);
         }
     }
-
-    let id = uuid::Uuid::new_v4().to_string();
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(id) = read_persisted_identity(std::path::Path::new(fallback_path))? {
+        return Ok(id);
     }
-    let _ = std::fs::write(path, &id);
-    id
+    let legacy = match legacy_path {
+        Some(path) => read_persisted_identity(path)?,
+        None => None,
+    };
+    read_or_generate_persisted(fallback_path, legacy)
+}
+
+fn read_identity(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+// A missing state file permits first installation; unreadable/corrupt state must
+// never be mistaken for a new physical host.
+fn read_persisted_identity(path: &std::path::Path) -> PlatformResult<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(identity) if !identity.trim().is_empty() => Ok(Some(identity.trim().to_string())),
+        Ok(_) => Err(PlatformError::Parse(
+            "persisted host identity is empty".to_string(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Generate or migrate identity only when its state can actually be persisted.
+/// create_new prevents concurrent first starts from overwriting the winning id.
+fn read_or_generate_persisted(path: &str, legacy: Option<String>) -> PlatformResult<String> {
+    use std::io::Write;
+    if let Some(id) = read_persisted_identity(std::path::Path::new(path))? {
+        return Ok(id);
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let id = legacy.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return read_persisted_identity(std::path::Path::new(path))?.ok_or_else(|| {
+                PlatformError::Parse(
+                    "persisted host identity disappeared while initializing".to_string(),
+                )
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    file.write_all(id.as_bytes())?;
+    file.sync_all()?;
+    Ok(id)
 }
 
 /// TCP state codes from /proc/net/tcp.
@@ -323,8 +376,8 @@ mod tests {
         let path = dir.join("host-id");
         let path = path.to_str().unwrap();
 
-        let first = read_or_generate_persisted(path);
-        let second = read_or_generate_persisted(path);
+        let first = read_or_generate_persisted(path, None).unwrap();
+        let second = read_or_generate_persisted(path, None).unwrap();
 
         assert_eq!(first, second, "generated id must persist across calls");
         assert!(!first.is_empty());
@@ -334,5 +387,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_first_starts_never_overwrite_the_winning_identity() {
+        let directory =
+            std::env::temp_dir().join(format!("dodo-host-id-race-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("host-id");
+        let barrier = std::sync::Barrier::new(16);
+        let identities = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        read_or_generate_persisted(path.to_str().unwrap(), None)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| match handle.join().unwrap() {
+                    Ok(identity) => Some(identity),
+                    // A second process may see the first writer's empty file;
+                    // it fails closed and can retry after initialization.
+                    Err(PlatformError::Parse(_)) => None,
+                    Err(error) => panic!("unexpected state IO failure: {error}"),
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(!identities.is_empty());
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(uuid::Uuid::parse_str(&persisted).is_ok());
+        assert!(identities.iter().all(|identity| identity == &persisted));
+        assert_eq!(
+            read_or_generate_persisted(path.to_str().unwrap(), None).unwrap(),
+            persisted
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

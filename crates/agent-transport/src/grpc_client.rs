@@ -95,6 +95,7 @@ impl GrpcClient {
         channel: tonic::transport::Channel,
         envelopes: Vec<proto::AgentEnvelope>,
     ) -> TransportResult<SubmitResult> {
+        let count = envelopes.len();
         let mut client = IngestorServiceClient::new(channel);
         let mut request = tonic::Request::new(proto::SubmitBatchRequest { envelopes });
 
@@ -104,10 +105,15 @@ impl GrpcClient {
             .submit_batch(request)
             .await
             .map_err(|e| TransportError::Grpc {
-                code: e.code().to_string(),
+                code: e.code(),
                 message: e.message().to_string(),
             })?;
         let resp = response.into_inner();
+        if u64::from(resp.accepted) + u64::from(resp.rejected) != count as u64 {
+            return Err(TransportError::NotRetryable(
+                "invalid upstream acknowledgement count".into(),
+            ));
+        }
         Ok(SubmitResult {
             accepted: resp.accepted,
             rejected: resp.rejected,
@@ -156,5 +162,160 @@ impl GrpcClient {
         let mut guard = self.channel.lock().await;
         *guard = None;
         info!("gRPC client disconnected");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn state() -> agent_core::AgentState {
+        agent_core::AgentState::new(
+            "agent".into(),
+            "version".into(),
+            "linux".into(),
+            "hostname".into(),
+            "host-id".into(),
+            "linux".into(),
+        )
+    }
+    fn envelopes() -> Vec<Envelope> {
+        [
+            agent_core::SignalType::Metric,
+            agent_core::SignalType::Log,
+            agent_core::SignalType::Trace,
+            agent_core::SignalType::Event,
+            agent_core::SignalType::Inventory,
+            agent_core::SignalType::Heartbeat,
+            agent_core::SignalType::SecurityEvent,
+            agent_core::SignalType::CustomEvent,
+        ]
+        .into_iter()
+        .map(|signal_type| Envelope {
+            signal_type,
+            payload: vec![42],
+            timestamp_unix_ns: 123,
+            buffered: true,
+            retry_count: 2,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn wire_envelopes_carry_only_enrolled_identity_and_canonical_compression() {
+        let messages = GrpcClient::build_proto_envelopes(&envelopes(), &state());
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(message.signal_type, index as i32 + 1);
+            assert_eq!(message.compression, 1);
+            assert_eq!(message.agent_id, "agent");
+            assert_eq!(message.host_id, "host-id");
+            assert_eq!(message.hostname, "hostname");
+            assert_eq!(message.agent_version, "version");
+            assert_eq!(message.agent_variant, "linux");
+            assert_eq!(message.os_family, "linux");
+            assert_eq!(message.timestamp_unix_ns, 123);
+            assert_eq!(message.payload, vec![42]);
+            assert!(message.buffered);
+            assert_eq!(message.retry_count, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_grpc_retries_unavailable_and_reuses_connection_with_auth() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let server = crate::test_network::grpc(move |request| {
+            assert_eq!(
+                request.uri().path(),
+                "/dodo.proto.v1.IngestorService/SubmitBatch"
+            );
+            assert_eq!(request.headers()["authorization"], "Bearer synthetic-jwt");
+            assert_eq!(request.headers()["x-api-key"], "synthetic-key");
+            let batch = proto::SubmitBatchRequest::decode(&request.body()[5..]).unwrap();
+            assert_eq!(batch.envelopes[0].agent_id, "agent");
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                return (14, vec![]);
+            }
+            (
+                0,
+                proto::SubmitBatchResponse {
+                    accepted: batch.envelopes.len() as u32,
+                    rejected: 0,
+                    errors: vec![],
+                }
+                .encode_to_vec(),
+            )
+        })
+        .await;
+        let config = TransportConfig {
+            endpoint_address: server.address.clone(),
+            tls_enabled: false,
+            timeout_ms: 1000,
+            retry_max: 1,
+            retry_backoff_ms: 1,
+            api_key: Some("synthetic-key".into()),
+            ..Default::default()
+        };
+        *config.agent_jwt.write().unwrap() = Some("synthetic-jwt".into());
+        let client = GrpcClient::new(config);
+        assert_eq!(
+            client
+                .submit_batch(envelopes(), &state())
+                .await
+                .unwrap()
+                .accepted,
+            8
+        );
+        assert_eq!(
+            client
+                .submit_batch(envelopes(), &state())
+                .await
+                .unwrap()
+                .accepted,
+            8
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        client.disconnect().await;
+        assert!(client.channel.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn partial_and_invalid_acknowledgements_never_duplicate_accepted_data() {
+        for invalid in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let server = crate::test_network::grpc(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                (
+                    0,
+                    proto::SubmitBatchResponse {
+                        accepted: 3,
+                        rejected: if invalid { 0 } else { 5 },
+                        errors: vec!["explicit upstream rejection".into()],
+                    }
+                    .encode_to_vec(),
+                )
+            })
+            .await;
+            let client = GrpcClient::new(TransportConfig {
+                endpoint_address: server.address.clone(),
+                tls_enabled: false,
+                retry_max: 3,
+                retry_backoff_ms: 1,
+                ..Default::default()
+            });
+            let result = client.submit_batch(envelopes(), &state()).await;
+            if invalid {
+                assert!(matches!(result, Err(TransportError::NotRetryable(_))));
+                assert!(client.channel.lock().await.is_none());
+            } else {
+                let result = result.unwrap();
+                assert_eq!((result.accepted, result.rejected), (3, 5));
+                assert_eq!(result.errors, ["explicit upstream rejection"]);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
     }
 }

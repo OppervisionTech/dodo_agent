@@ -24,26 +24,31 @@ jobs:
           - variant: linux
             arch: amd64
             target: x86_64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent
             pkg: tar
           - variant: linux
             arch: arm64
             target: aarch64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent
             pkg: tar
           - variant: lite
             arch: amd64
             target: x86_64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent-lite
             pkg: tar
           - variant: lite
             arch: arm64
             target: aarch64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent-lite
             pkg: tar
           - variant: windows
             arch: amd64
             target: x86_64-pc-windows-gnu
+            source_binary: aegis-agent.exe
             binary: aegis-agent.exe
             pkg: zip
     steps:
@@ -71,17 +76,17 @@ jobs:
 
       - name: Build (native amd64)
         if: matrix.arch == 'amd64'
-        run: cargo build --release --features ${{ matrix.variant }} --target ${{ matrix.target }}
+        run: cargo build --release --locked --no-default-features --features ${{ matrix.variant }} --target ${{ matrix.target }}
 
       - name: Build (cross arm64)
         if: matrix.arch == 'arm64'
-        run: cross build --release --features ${{ matrix.variant }} --target ${{ matrix.target }}
+        run: cross build --release --locked --no-default-features --features ${{ matrix.variant }} --target ${{ matrix.target }}
 
       - name: Package binary (tar)
         if: matrix.pkg == 'tar'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.binary }}
+          cp target/${{ matrix.target }}/release/${{ matrix.source_binary }} dist/${{ matrix.binary }}
           cd dist
           sha256sum ${{ matrix.binary }} > ${{ matrix.binary }}.sha256
           tar -czf aegis-agent-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz ${{ matrix.binary }}
@@ -91,7 +96,7 @@ jobs:
         if: matrix.pkg == 'zip'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.binary }}
+          cp target/${{ matrix.target }}/release/${{ matrix.source_binary }} dist/${{ matrix.binary }}
           cd dist
           sha256sum ${{ matrix.binary }} > ${{ matrix.binary }}.sha256
           zip aegis-agent-${{ matrix.variant }}-${{ matrix.arch }}.zip ${{ matrix.binary }}
@@ -173,10 +178,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  verify-public-image:
+    name: Verify anonymous image pull
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - name: Pull the published version without credentials
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          export DOCKER_CONFIG="$(mktemp -d)"
+          docker pull "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${version}"
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, docker]
+    needs: [build-binaries, docker, verify-public-image]
     steps:
       - uses: actions/checkout@v4
 
@@ -199,7 +215,12 @@ jobs:
           cat release/*.sha256 > release/checksums.sha256
 
       - name: Copy install script
-        run: cp scripts/install.sh release/install.sh
+        run: |
+          cp get.sh release/get.sh
+          cp get.sh release/install.sh
+          cmp get.sh scripts/install.sh
+          (cd release && sha256sum get.sh > get.sh.sha256 && sha256sum install.sh > install.sh.sha256)
+          cat release/get.sh.sha256 release/install.sh.sha256 >> release/checksums.sha256
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -219,7 +240,9 @@ jobs:
 
             **Linux:**
             ```bash
-            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/get.sh -o get.sh
+            # Set DODO_API_KEY and the environment endpoints from the installation manifest.
+            sudo -E bash get.sh --version ${{ github.ref_name }} --endpoint "$DODO_ENDPOINT" --enrollment-endpoint "$DODO_ENROLLMENT_ENDPOINT"
             ```
 
             **Docker:**

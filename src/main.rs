@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     // Load config
     let config_path =
         std::env::var("AEGIS_CONFIG").unwrap_or_else(|_| "/etc/aegis/agent.yaml".to_string());
-    let config = agent_config::loader::load_or_default(&config_path);
+    let config = agent_config::loader::load_or_default(&config_path)?;
 
     // Initialize logging
     init_tracing(&config.logging);
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
         let certs_dir = std::path::Path::new(&config.tls.client_cert_path)
             .parent()
             .and_then(|p| p.to_str())
-            .unwrap_or("/etc/aegis/certs")
+            .unwrap_or("/var/lib/aegis/certs")
             .to_string();
         enroll_with_retry(
             &config.enrollment_endpoint,
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
             &certs_dir,
             &agent_jwt,
         )
-        .await;
+        .await?;
     }
 
     // Spawn batch consumer (transport layer)
@@ -204,12 +204,18 @@ async fn main() -> Result<()> {
     if config.tls.enabled && !config.enrollment_endpoint.is_empty() {
         let refresh_endpoint = config.enrollment_endpoint.clone();
         let refresh_api_key = std::env::var("DODO_API_KEY").unwrap_or_default();
+        let refresh_certs_dir = std::path::Path::new(&config.tls.client_key_path)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("client_key_path has no parent"))?
+            .to_string_lossy()
+            .to_string();
         let refresh_agent_id = agent_state.agent_id.clone();
         let refresh_token = agent_jwt.clone();
         let refresh_cancel = cancel_token.clone();
         tokio::spawn(async move {
             run_token_refresh(
                 refresh_endpoint,
+                refresh_certs_dir,
                 refresh_api_key,
                 refresh_agent_id,
                 refresh_token,
@@ -539,7 +545,7 @@ async fn enroll_with_retry(
     client_cert_path: &str,
     certs_dir: &str,
     token: &agent_transport::SharedToken,
-) {
+) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 6;
     const BASE_BACKOFF_MS: u64 = 2000;
     const MAX_BACKOFF_MS: u64 = 15000;
@@ -556,7 +562,7 @@ async fn enroll_with_retry(
         )
         .await
         {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(e) if attempt < MAX_ATTEMPTS => {
                 let backoff_ms = (BASE_BACKOFF_MS * 2u64.pow(attempt - 1)).min(MAX_BACKOFF_MS);
                 warn!(
@@ -572,11 +578,13 @@ async fn enroll_with_retry(
                 warn!(
                     error = %e,
                     attempt,
-                    "certificate enrollment failed — will retry on next startup"
+                    "certificate enrollment failed — refusing startup"
                 );
+                return Err(e);
             }
         }
     }
+    anyhow::bail!("enrollment exhausted")
 }
 
 /// Keeps `token` populated with a live agent JWT for as long as the agent
@@ -591,6 +599,7 @@ async fn enroll_with_retry(
 /// this loop's first iteration.
 async fn run_token_refresh(
     enrollment_endpoint: String,
+    certs_dir: String,
     api_key: String,
     agent_id: String,
     token: agent_transport::SharedToken,
@@ -608,6 +617,7 @@ async fn run_token_refresh(
             &enrollment_endpoint,
             &api_key,
             &agent_id,
+            &certs_dir,
             &token,
         )
         .await
@@ -644,42 +654,32 @@ async fn run_transport(
         }
     };
 
-    // First, drain any buffered data from previous run
-    if let Some(ref buf) = disk_buffer {
-        if buf.has_data() {
-            info!("draining buffered data from previous run");
-            match buf.drain(500) {
-                Ok(envelopes) if !envelopes.is_empty() => {
-                    info!(count = envelopes.len(), "drained buffered envelopes");
-                    if let Err(e) = grpc_client.submit_batch(envelopes, &agent_state).await {
-                        warn!(error = %e, "failed to send drained buffer data");
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    // Tick immediately at startup, then continue retrying without requiring a
+    // process restart. Peek never removes durable records before an ACK.
+    let mut disk_retry = tokio::time::interval(std::time::Duration::from_secs(5));
+    disk_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
                 info!("transport shutting down, draining remaining batches");
-                // Drain ALL remaining batches from the channel
+                // Cancellation is shared with the batcher. An empty queue does
+                // not mean its final flush has happened: wait until the batcher
+                // drops its sender, including batches produced after we began
+                // shutdown. main() bounds the entire shutdown to ten seconds.
                 let mut drained = 0u64;
                 let mut failed = 0u64;
-                while let Ok(batch) = batch_rx.try_recv() {
+                while let Some(batch) = batch_rx.recv().await {
                     let batch_size = batch.len();
                     match grpc_client.submit_batch(batch.clone(), &agent_state).await {
                         Ok(result) => {
                             drained += result.accepted as u64;
-                            agent_state.envelopes_sent.fetch_add(
-                                result.accepted as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            record_delivery(&agent_state, &result);
                         }
                         Err(e) => {
                             warn!(error = %e, batch_size = batch_size, "shutdown batch send failed, buffering to disk");
                             failed += batch_size as u64;
+                            agent_state.envelopes_failed.fetch_add(batch_size as u64, std::sync::atomic::Ordering::Relaxed);
                             // Buffer to disk if available
                             if let Some(ref buf) = disk_buffer {
                                 if let Err(be) = buf.write(&batch) {
@@ -698,14 +698,29 @@ async fn run_transport(
                 grpc_client.disconnect().await;
                 return;
             }
+            _ = disk_retry.tick() => {
+                if let Some(ref buffer) = disk_buffer {
+                    match buffer.peek(500) {
+                        Ok(pending) if !pending.envelopes.is_empty() => {
+                            match grpc_client.submit_batch(pending.envelopes.clone(), &agent_state).await {
+                                Ok(result) => {
+                                    record_delivery(&agent_state, &result);
+                                    if let Err(error) = buffer.acknowledge(&pending) { warn!(error=%error,"disk acknowledgement failed; records remain replayable"); }
+                                    agent_state.buffer_used_bytes.store(buffer.used_bytes(),std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(error) => warn!(error=%error,"disk replay failed; retaining unacknowledged records"),
+                            }
+                        }
+                        Err(error) => warn!(error=%error,"disk replay read failed; retaining records"),
+                        _ => {}
+                    }
+                }
+            }
             Some(batch) = batch_rx.recv() => {
                 let batch_size = batch.len();
                 match grpc_client.submit_batch(batch.clone(), &agent_state).await {
                     Ok(result) => {
-                        agent_state.envelopes_sent.fetch_add(
-                            result.accepted as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        record_delivery(&agent_state, &result);
                     }
                     Err(e) => {
                         warn!(error = %e, batch_size = batch_size, "batch send failed, buffering to disk");
@@ -728,5 +743,502 @@ async fn run_transport(
                 }
             }
         }
+    }
+}
+
+fn record_delivery(state: &agent_core::AgentState, result: &agent_transport::SubmitResult) {
+    state
+        .envelopes_sent
+        .fetch_add(result.accepted as u64, std::sync::atomic::Ordering::Relaxed);
+    state
+        .envelopes_failed
+        .fetch_add(result.rejected as u64, std::sync::atomic::Ordering::Relaxed);
+    if result.rejected > 0 {
+        warn!(
+            accepted = result.accepted,
+            rejected = result.rejected,
+            "upstream rejected acknowledged envelopes; not retrying accepted subset"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/support/network.rs"]
+mod test_network;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::{Envelope, SignalType};
+    use agent_transport::{
+        buffer::{BufferConfig, DiskBuffer},
+        proto::{SubmitBatchRequest, SubmitBatchResponse},
+        TransportConfig,
+    };
+    use prost::Message;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn state() -> Arc<agent_core::AgentState> {
+        Arc::new(agent_core::AgentState::new(
+            "agent".into(),
+            "version".into(),
+            "linux".into(),
+            "host".into(),
+            "machine".into(),
+            "linux".into(),
+        ))
+    }
+    fn envelope() -> Envelope {
+        Envelope {
+            signal_type: SignalType::Metric,
+            payload: vec![42],
+            timestamp_unix_ns: 1,
+            buffered: false,
+            retry_count: 0,
+        }
+    }
+    fn buffer(directory: &test_network::Directory) -> BufferConfig {
+        BufferConfig {
+            path: directory.0.join("buffer").to_str().unwrap().into(),
+            max_size_bytes: 4096,
+            drain_rate_per_second: 1,
+        }
+    }
+    fn transport(address: &str) -> TransportConfig {
+        TransportConfig {
+            endpoint_address: address.into(),
+            tls_enabled: false,
+            retry_max: 0,
+            timeout_ms: 2000,
+            ..Default::default()
+        }
+    }
+    async fn wait_for(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !condition() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn identity_persists_and_acknowledged_rejections_are_counted_separately() {
+        let directory = test_network::Directory::new();
+        let path = directory.0.join("nested/agent-id");
+        let first = load_or_create_agent_id(path.to_str().unwrap()).unwrap();
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert_eq!(
+            load_or_create_agent_id(path.to_str().unwrap()).unwrap(),
+            first
+        );
+        std::fs::write(&path, " \n").unwrap();
+        assert_ne!(
+            load_or_create_agent_id(path.to_str().unwrap()).unwrap(),
+            first
+        );
+        assert!(load_or_create_agent_id(directory.0.to_str().unwrap()).is_err());
+        assert!(matches!(
+            agent_variant(),
+            "linux" | "windows" | "lite" | "unknown"
+        ));
+        let state = state();
+        record_delivery(
+            &state,
+            &agent_transport::SubmitResult {
+                accepted: 2,
+                rejected: 1,
+                errors: vec![],
+            },
+        );
+        assert_eq!(state.envelopes_sent.load(Ordering::Relaxed), 2);
+        assert_eq!(state.envelopes_failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn configured_collectors_honor_enabled_flags_and_paths_without_collecting_host_data() {
+        let names = [
+            "cpu",
+            "memory",
+            "disk",
+            "network",
+            "process",
+            "security",
+            "certs",
+            "logs",
+            "kubernetes",
+            "inventory",
+            "self_metrics",
+            "heartbeat",
+        ];
+        let collectors = names
+            .iter()
+            .map(|name| agent_config::CollectorLocalConfig {
+                name: (*name).into(),
+                enabled: true,
+                interval_seconds: 1,
+                parameters: [
+                    ("monitored_files", "/fixture/one,/fixture/two"),
+                    ("scan_paths", "/fixture/certs"),
+                    ("paths", "/fixture/log"),
+                    ("max_lines_per_sec", "5"),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+            })
+            .collect();
+        let mut config = agent_config::LocalAgentConfig {
+            collectors,
+            ..Default::default()
+        };
+        config.collectors.push(agent_config::CollectorLocalConfig {
+            name: "ignored".into(),
+            enabled: true,
+            interval_seconds: 1,
+            parameters: Default::default(),
+        });
+        config.collectors.push(agent_config::CollectorLocalConfig {
+            name: "cpu".into(),
+            enabled: false,
+            interval_seconds: 1,
+            parameters: Default::default(),
+        });
+        let mut registry = agent_core::CollectorRegistry::new();
+        register_collectors(
+            &mut registry,
+            &config,
+            Arc::new(agent_platform::common::MockPlatform::new()),
+            state(),
+            Arc::new(agent_core::RedactionEngine::new(&[]).unwrap()),
+        );
+        assert_eq!(
+            registry
+                .collectors()
+                .iter()
+                .map(|c| c.name())
+                .collect::<Vec<_>>(),
+            names
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_batch_survives_shutdown_and_replays_after_restart() {
+        let directory = test_network::Directory::new();
+        let config = buffer(&directory);
+        let unavailable = test_network::grpc(|_| (14, vec![])).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let cancel = CancellationToken::new();
+        let agent_state = state();
+        let task_state = agent_state.clone();
+        let task_cancel = cancel.clone();
+        let task_config = config.clone();
+        let endpoint = unavailable.address.clone();
+        let task = tokio::spawn(async move {
+            run_transport(
+                &mut rx,
+                transport(&endpoint),
+                task_config,
+                task_cancel,
+                task_state,
+            )
+            .await
+        });
+        tx.send(vec![envelope()]).await.unwrap();
+        wait_for(|| agent_state.buffer_used_bytes.load(Ordering::Relaxed) > 0).await;
+        drop(tx);
+        cancel.cancel();
+        task.await.unwrap();
+        assert_eq!(agent_state.envelopes_failed.load(Ordering::Relaxed), 1);
+        let disk = DiskBuffer::new(&config).unwrap();
+        assert_eq!(disk.peek(10).unwrap().envelopes.len(), 1);
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let observed = delivered.clone();
+        let server = test_network::grpc(move |request| {
+            let batch = SubmitBatchRequest::decode(&request.body()[5..]).unwrap();
+            assert!(batch.envelopes[0].buffered);
+            observed.fetch_add(batch.envelopes.len(), Ordering::SeqCst);
+            (
+                0,
+                SubmitBatchResponse {
+                    accepted: batch.envelopes.len() as u32,
+                    rejected: 0,
+                    errors: vec![],
+                }
+                .encode_to_vec(),
+            )
+        })
+        .await;
+        let (_tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task_state = agent_state.clone();
+        let endpoint = server.address.clone();
+        let task = tokio::spawn(async move {
+            run_transport(
+                &mut rx,
+                transport(&endpoint),
+                config,
+                task_cancel,
+                task_state,
+            )
+            .await
+        });
+        wait_for(|| {
+            agent_state.envelopes_sent.load(Ordering::Relaxed) == 1
+                && agent_state.buffer_used_bytes.load(Ordering::Relaxed) == 0
+        })
+        .await;
+        drop(_tx);
+        cancel.cancel();
+        task.await.unwrap();
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+        assert!(disk.peek(10).unwrap().envelopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_batchers_late_flush_and_preserves_failed_delivery() {
+        for fails in [false, true] {
+            let directory = test_network::Directory::new();
+            let config = buffer(&directory);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let server = test_network::grpc(move |request| {
+                let batch = SubmitBatchRequest::decode(&request.body()[5..]).unwrap();
+                assert_eq!(batch.envelopes.len(), 1);
+                assert_eq!(batch.envelopes[0].payload, vec![42]);
+                observed.fetch_add(1, Ordering::SeqCst);
+                if fails {
+                    return (14, vec![]);
+                }
+                (
+                    0,
+                    SubmitBatchResponse {
+                        accepted: 1,
+                        rejected: 0,
+                        errors: vec![],
+                    }
+                    .encode_to_vec(),
+                )
+            })
+            .await;
+
+            let (envelope_tx, envelope_rx) = tokio::sync::mpsc::channel(10);
+            let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel(10);
+            let batcher_cancel = CancellationToken::new();
+            let batcher_token = batcher_cancel.clone();
+            let batcher_task = tokio::spawn(agent_core::batcher::run(
+                envelope_rx,
+                batch_tx,
+                agent_core::BatcherConfig {
+                    flush_interval_ms: 60_000,
+                    max_batch_size: 10,
+                },
+                batcher_token,
+            ));
+            envelope_tx.send(envelope()).await.unwrap();
+            wait_for(|| envelope_tx.capacity() == 10).await;
+
+            // Deliver cancellation to transport first, reproducing the valid
+            // scheduling order where the batcher has not yet run its final
+            // flush. Its batch queue is still empty at this point.
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let agent_state = state();
+            let task_state = agent_state.clone();
+            let task_config = config.clone();
+            let endpoint = server.address.clone();
+            let mut transport_task = tokio::spawn(async move {
+                run_transport(
+                    &mut batch_rx,
+                    transport(&endpoint),
+                    task_config,
+                    cancel,
+                    task_state,
+                )
+                .await
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut transport_task)
+                    .await
+                    .is_err(),
+                "transport must wait for the batcher's final flush"
+            );
+
+            batcher_cancel.cancel();
+            drop(envelope_tx);
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                batcher_task.await.unwrap().unwrap();
+                transport_task.await.unwrap();
+            })
+            .await
+            .expect("shutdown must finish once the batcher closes its sender");
+
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                agent_state.envelopes_sent.load(Ordering::Relaxed),
+                if fails { 0 } else { 1 }
+            );
+            assert_eq!(
+                agent_state.envelopes_failed.load(Ordering::Relaxed),
+                if fails { 1 } else { 0 }
+            );
+            let disk = DiskBuffer::new(&config).unwrap();
+            assert_eq!(
+                disk.peek(10).unwrap().envelopes.len(),
+                if fails { 1 } else { 0 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_batches_and_reports_failures_even_without_a_usable_buffer() {
+        for fails in [false, true] {
+            let directory = test_network::Directory::new();
+            let mut config = buffer(&directory);
+            if fails {
+                std::fs::write(directory.0.join("blocked"), "file").unwrap();
+                config.path = directory.0.join("blocked/buffer").to_str().unwrap().into();
+            }
+            let server = test_network::grpc(move |request| {
+                if fails {
+                    return (14, vec![]);
+                }
+                let batch = SubmitBatchRequest::decode(&request.body()[5..]).unwrap();
+                (
+                    0,
+                    SubmitBatchResponse {
+                        accepted: batch.envelopes.len() as u32,
+                        rejected: 0,
+                        errors: vec![],
+                    }
+                    .encode_to_vec(),
+                )
+            })
+            .await;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+            tx.send(vec![envelope()]).await.unwrap();
+            tx.send(vec![envelope()]).await.unwrap();
+            drop(tx);
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let agent_state = state();
+            run_transport(
+                &mut rx,
+                transport(&server.address),
+                config,
+                cancel,
+                agent_state.clone(),
+            )
+            .await;
+            assert_eq!(
+                agent_state.envelopes_sent.load(Ordering::Relaxed),
+                if fails { 0 } else { 2 }
+            );
+            assert_eq!(
+                agent_state.envelopes_failed.load(Ordering::Relaxed),
+                if fails { 2 } else { 0 }
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enrollment_retry_is_bounded_and_refresh_can_be_cancelled_on_error() {
+        let directory = test_network::Directory::new();
+        let token = agent_transport::SharedToken::default();
+        enroll_with_retry(
+            "",
+            "",
+            "agent",
+            "host",
+            "missing",
+            directory.0.to_str().unwrap(),
+            &token,
+        )
+        .await
+        .unwrap();
+        std::fs::write(directory.0.join("agent-key.pem"), "invalid key").unwrap();
+        assert!(enroll_with_retry(
+            "http://127.0.0.1:1/v1/enroll",
+            "synthetic-key",
+            "agent",
+            "host",
+            "missing",
+            directory.0.to_str().unwrap(),
+            &token
+        )
+        .await
+        .is_err());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        run_token_refresh(
+            "http://127.0.0.1:1/v1/enroll".into(),
+            directory.0.to_str().unwrap().into(),
+            "synthetic-key".into(),
+            "agent".into(),
+            token.clone(),
+            cancel.clone(),
+        )
+        .await;
+        run_token_refresh(
+            String::new(),
+            String::new(),
+            String::new(),
+            "agent".into(),
+            token,
+            cancel,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn periodic_refresh_populates_token_immediately_and_stops_on_shutdown() {
+        let directory = test_network::Directory::new();
+        let certificate = rcgen::Certificate::from_params(rcgen::CertificateParams::default())
+            .unwrap()
+            .serialize_pem()
+            .unwrap();
+        let server = test_network::http(move |request| {
+            let response = if request.uri().path() == "/v1/enroll" {
+                serde_json::json!({"ca_cert_pem":certificate,"agent_cert_pem":certificate,
+                    "expires_at":"future","agent_jwt":"enrolled-token"})
+            } else {
+                serde_json::json!({"agent_jwt":"refreshed-token","agent_jwt_expires_at":"future"})
+            };
+            (200, serde_json::to_vec(&response).unwrap())
+        })
+        .await;
+        let endpoint = format!("http://{}/v1/enroll", server.address);
+        let token = agent_transport::SharedToken::default();
+        enroll_with_retry(
+            &endpoint,
+            "synthetic-key",
+            "agent",
+            "host",
+            directory.0.join("agent.pem").to_str().unwrap(),
+            directory.0.to_str().unwrap(),
+            &token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(token.read().unwrap().as_deref(), Some("enrolled-token"));
+        *token.write().unwrap() = None;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_token_refresh(
+            endpoint,
+            directory.0.to_str().unwrap().into(),
+            "synthetic-key".into(),
+            "agent".into(),
+            token.clone(),
+            cancel.clone(),
+        ));
+        wait_for(|| token.read().unwrap().as_deref() == Some("refreshed-token")).await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
