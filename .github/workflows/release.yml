@@ -19,6 +19,8 @@ jobs:
     name: Build ${{ matrix.variant }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
+      # One broken variant must not cancel the others.
+      fail-fast: false
       matrix:
         include:
           - variant: linux
@@ -71,11 +73,11 @@ jobs:
 
       - name: Build (native amd64)
         if: matrix.arch == 'amd64'
-        run: cargo build --release --features ${{ matrix.variant }} --target ${{ matrix.target }}
+        run: cargo build --release ${{ matrix.variant != 'linux' && '--no-default-features' || '' }} --features ${{ matrix.variant }} --target ${{ matrix.target }}
 
       - name: Build (cross arm64)
         if: matrix.arch == 'arm64'
-        run: cross build --release --features ${{ matrix.variant }} --target ${{ matrix.target }}
+        run: cross build --release ${{ matrix.variant != 'linux' && '--no-default-features' || '' }} --features ${{ matrix.variant }} --target ${{ matrix.target }}
 
       - name: Package binary (tar)
         if: matrix.pkg == 'tar'
