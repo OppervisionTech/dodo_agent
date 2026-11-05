@@ -107,17 +107,20 @@ async fn main() -> Result<()> {
 
     // Update agent state with active collectors
     {
-        let mut ac = agent_state
-            .active_collectors
-            .write()
-            .expect("lock poisoned");
+        let mut ac = agent_state.active_collectors.write().unwrap_or_else(|e| {
+            tracing::error!("active_collectors lock poisoned, recovering: {}", e);
+            e.into_inner()
+        });
         *ac = active_names;
     }
 
     // Set initial config hash
     {
         let hash = agent_config::loader::config_hash(&config);
-        let mut ch = agent_state.config_hash.write().expect("lock poisoned");
+        let mut ch = agent_state.config_hash.write().unwrap_or_else(|e| {
+            tracing::error!("config_hash lock poisoned, recovering: {}", e);
+            e.into_inner()
+        });
         *ch = hash;
     }
 
@@ -153,6 +156,34 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Auto-enroll mTLS certificates if missing or expiring soon.
+    // Runs before transport init so that certs are on disk when the gRPC channel opens.
+    // Retried a few times in-process: the enrollment endpoint's key check depends
+    // on an upstream call with a tight timeout budget, so transient failures are
+    // common and usually resolve within a couple of attempts — without a retry
+    // here, the agent would proceed with no certs and buffer every undeliverable
+    // batch to disk indefinitely.
+    let agent_jwt: agent_transport::SharedToken = Default::default();
+
+    if config.tls.enabled {
+        let api_key = std::env::var("DODO_API_KEY").unwrap_or_default();
+        let certs_dir = std::path::Path::new(&config.tls.client_cert_path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("/etc/aegis/certs")
+            .to_string();
+        enroll_with_retry(
+            &config.enrollment_endpoint,
+            &api_key,
+            &agent_state.agent_id,
+            &agent_state.host_id,
+            &config.tls.client_cert_path,
+            &certs_dir,
+            &agent_jwt,
+        )
+        .await;
+    }
+
     // Spawn batch consumer (transport layer)
     let transport_config = agent_transport::TransportConfig {
         endpoint_address: config.endpoint.address.clone(),
@@ -164,13 +195,46 @@ async fn main() -> Result<()> {
         client_cert_path: config.tls.client_cert_path.clone(),
         client_key_path: config.tls.client_key_path.clone(),
         verify_server: config.tls.verify_server,
+        api_key: std::env::var("DODO_API_KEY").ok().filter(|k| !k.is_empty()),
+        agent_jwt: agent_jwt.clone(),
     };
+
+    // Periodically refresh the short-lived agent JWT (independent of cert
+    // renewal — see agent_transport::enrollment::refresh_token for why).
+    if config.tls.enabled && !config.enrollment_endpoint.is_empty() {
+        let refresh_endpoint = config.enrollment_endpoint.clone();
+        let refresh_api_key = std::env::var("DODO_API_KEY").unwrap_or_default();
+        let refresh_agent_id = agent_state.agent_id.clone();
+        let refresh_token = agent_jwt.clone();
+        let refresh_cancel = cancel_token.clone();
+        tokio::spawn(async move {
+            run_token_refresh(
+                refresh_endpoint,
+                refresh_api_key,
+                refresh_agent_id,
+                refresh_token,
+                refresh_cancel,
+            )
+            .await;
+        });
+    }
 
     let buffer_config = agent_transport::buffer::BufferConfig {
         path: config.buffer.path.clone(),
         max_size_bytes: config.buffer.max_size_bytes,
         drain_rate_per_second: 1,
     };
+
+    // Spawn command channel (bidirectional gRPC stream for receiving platform commands)
+    // timeout_ms = 0 → no per-call deadline; the stream must stay open indefinitely.
+    let mut cmd_transport_config = transport_config.clone();
+    cmd_transport_config.timeout_ms = 0;
+    let cmd_agent_id = agent_state.agent_id.clone();
+    let cmd_cancel = cancel_token.clone();
+    let command_channel_handle = tokio::spawn(async move {
+        let channel = agent_command::CommandChannel::new(cmd_agent_id, cmd_transport_config);
+        channel.run(cmd_cancel).await;
+    });
 
     let transport_token = cancel_token.clone();
     let transport_state = agent_state.clone();
@@ -242,6 +306,10 @@ async fn main() -> Result<()> {
         // Wait for transport to finish sending
         let _ = transport_handle.await;
         info!("transport stopped");
+
+        // Wait for command channel
+        let _ = command_channel_handle.await;
+        info!("command channel stopped");
 
         // Wait for config watcher
         let _ = config_watcher_handle.await;
@@ -397,13 +465,8 @@ fn register_collectors(
                 )));
             }
             "otel" => {
-                let rate_limit = cc
-                    .parameters
-                    .get("rate_limit")
-                    .and_then(|s| s.parse().ok());
-                registry.register(Box::new(agent_collectors::OtelCollector::new(
-                    rate_limit,
-                )));
+                let rate_limit = cc.parameters.get("rate_limit").and_then(|s| s.parse().ok());
+                registry.register(Box::new(agent_collectors::OtelCollector::new(rate_limit)));
             }
             "kubernetes" => {
                 registry.register(Box::new(agent_collectors::KubernetesCollector::new(
@@ -458,6 +521,111 @@ fn register_collectors(
     }
 }
 
+/// Retries mTLS enrollment a few times with exponential backoff before
+/// giving up. The enrollment endpoint's key check depends on an upstream
+/// portal call with a tight timeout budget, so a single failed attempt is
+/// not a reliable signal that the key is actually invalid — worse, the
+/// ingestor caches ANY verify failure (including its own timeouts) as a
+/// negative result in Redis for `INGESTOR_AUTH_NEGATIVE_CACHE_TTL`
+/// (30s default — see dodo_ingestor/internal/auth/apikey.go). That poisons
+/// the key for real for 30s regardless of retries, so the total retry
+/// window here is deliberately kept comfortably above 30s to guarantee at
+/// least one attempt lands after the negative cache entry expires.
+async fn enroll_with_retry(
+    enrollment_endpoint: &str,
+    api_key: &str,
+    agent_id: &str,
+    host_id: &str,
+    client_cert_path: &str,
+    certs_dir: &str,
+    token: &agent_transport::SharedToken,
+) {
+    const MAX_ATTEMPTS: u32 = 6;
+    const BASE_BACKOFF_MS: u64 = 2000;
+    const MAX_BACKOFF_MS: u64 = 15000;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match agent_transport::enrollment::enroll_if_needed(
+            enrollment_endpoint,
+            api_key,
+            agent_id,
+            host_id,
+            client_cert_path,
+            certs_dir,
+            token,
+        )
+        .await
+        {
+            Ok(()) => return,
+            Err(e) if attempt < MAX_ATTEMPTS => {
+                let backoff_ms = (BASE_BACKOFF_MS * 2u64.pow(attempt - 1)).min(MAX_BACKOFF_MS);
+                warn!(
+                    error = %e,
+                    attempt,
+                    max = MAX_ATTEMPTS,
+                    backoff_ms,
+                    "certificate enrollment failed — retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    attempt,
+                    "certificate enrollment failed — will retry on next startup"
+                );
+            }
+        }
+    }
+}
+
+/// Keeps `token` populated with a live agent JWT for as long as the agent
+/// runs. Runs independently of certificate enrollment/renewal: the mTLS
+/// cert is valid for ~90 days, but the JWT Kong's jwt plugin requires on the
+/// ingestor route is capped at 1h server-side, so it needs its own much
+/// tighter refresh cycle (see agent_transport::enrollment::refresh_token).
+///
+/// Refreshes immediately on startup — enrollment only calls the portal (and
+/// so only sets an initial token) when the cert actually needed renewal,
+/// which on a warm restart it usually won't, leaving `token` empty until
+/// this loop's first iteration.
+async fn run_token_refresh(
+    enrollment_endpoint: String,
+    api_key: String,
+    agent_id: String,
+    token: agent_transport::SharedToken,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    if api_key.is_empty() {
+        warn!("agent JWT refresh disabled — DODO_API_KEY not set");
+        return;
+    }
+
+    const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+    loop {
+        let sleep_for = match agent_transport::enrollment::refresh_token(
+            &enrollment_endpoint,
+            &api_key,
+            &agent_id,
+            &token,
+        )
+        .await
+        {
+            Ok(interval) => interval,
+            Err(e) => {
+                warn!(error = %e, "agent JWT refresh failed — retrying shortly");
+                RETRY_BACKOFF
+            }
+        };
+
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(sleep_for) => {}
+        }
+    }
+}
+
 async fn run_transport(
     batch_rx: &mut tokio::sync::mpsc::Receiver<Vec<agent_core::Envelope>>,
     transport_config: agent_transport::TransportConfig,
@@ -495,14 +663,38 @@ async fn run_transport(
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                info!("transport shutting down");
-                // Final drain attempt
-                if let Some(batch) = batch_rx.recv().await {
-                    if let Err(e) = grpc_client.submit_batch(batch, &agent_state).await {
-                        warn!(error = %e, "final batch send failed, buffering");
-                        // Buffer to disk if available
+                info!("transport shutting down, draining remaining batches");
+                // Drain ALL remaining batches from the channel
+                let mut drained = 0u64;
+                let mut failed = 0u64;
+                while let Ok(batch) = batch_rx.try_recv() {
+                    let batch_size = batch.len();
+                    match grpc_client.submit_batch(batch.clone(), &agent_state).await {
+                        Ok(result) => {
+                            drained += result.accepted as u64;
+                            agent_state.envelopes_sent.fetch_add(
+                                result.accepted as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, batch_size = batch_size, "shutdown batch send failed, buffering to disk");
+                            failed += batch_size as u64;
+                            // Buffer to disk if available
+                            if let Some(ref buf) = disk_buffer {
+                                if let Err(be) = buf.write(&batch) {
+                                    error!(error = %be, "failed to write to disk buffer during shutdown");
+                                } else {
+                                    agent_state.buffer_used_bytes.store(
+                                        buf.used_bytes(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
+                info!(drained = drained, failed = failed, "transport shutdown drain complete");
                 grpc_client.disconnect().await;
                 return;
             }

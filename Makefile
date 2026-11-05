@@ -1,4 +1,6 @@
-.PHONY: fmt lint test build-linux build-windows build-lite clean check \
+.PHONY: fmt lint test test-unit test-property test-integration test-security \
+       test-security-static test-mutation test-coverage test-all \
+       build-linux build-windows build-lite clean check \
        dist dist-linux-amd64 dist-linux-arm64 docker install
 
 # Formatting
@@ -9,9 +11,40 @@ fmt:
 lint:
 	cargo clippy --features linux -- -D warnings
 
-# Run tests
+# Run all tests
 test:
 	cargo test --features linux --all
+
+## test-unit: Run only inline unit tests
+test-unit:
+	cargo test --features linux --lib --all
+
+## test-property: Run property-based tests (proptest)
+test-property:
+	cargo test --features linux --all prop
+
+## test-integration: Run integration tests
+test-integration:
+	cargo test --features linux --all --test '*'
+
+## test-security: Run dynamic security tests
+test-security:
+	cargo test --features linux --all security
+
+## test-security-static: Run static security analysis
+test-security-static:
+	bash scripts/security_audit.sh
+
+## test-mutation: Run mutation tests (requires cargo-mutants)
+test-mutation:
+	bash scripts/mutation_test.sh
+
+## test-coverage: Generate coverage report
+test-coverage:
+	bash scripts/check_coverage.sh
+
+## test-all: Run all test types
+test-all: test test-property test-integration test-security test-security-static
 
 # Check compilation (all variants)
 check:

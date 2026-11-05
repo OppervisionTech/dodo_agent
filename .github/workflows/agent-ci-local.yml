@@ -1,0 +1,133 @@
+name: Agent CI (local)
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: Format Check
+    runs-on: [self-hosted, local]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy Lint
+    runs-on: [self-hosted, local]
+    strategy:
+      matrix:
+        feature: [linux, windows, lite]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          if [ "${{ matrix.feature }}" = "linux" ]; then
+            cargo clippy --features linux -- -D warnings
+          else
+            cargo clippy --no-default-features --features ${{ matrix.feature }} -- -D warnings
+          fi
+
+  test:
+    name: Tests
+    runs-on: [self-hosted, local]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features linux --all
+
+  coverage:
+    name: Code Coverage
+    runs-on: [self-hosted, local]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+
+      - name: Run coverage
+        run: |
+          cargo tarpaulin \
+            --features linux \
+            --workspace \
+            --out Html Lcov Json \
+            --output-dir coverage/ \
+            --timeout 120 \
+            --exclude-files "*/target/*" "*/tests/*"
+
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(cargo tarpaulin --features linux --workspace --out Stdout 2>/dev/null \
+            | grep -oP '[\d.]+(?= % coverage)' | tail -1 || echo "0")
+          echo "### Coverage: ${COVERAGE}%" >> "$GITHUB_STEP_SUMMARY"
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+            echo "Coverage ${COVERAGE}% is below 80% threshold" >&2
+            exit 1
+          fi
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14
+
+      - name: Upload lcov to Coveralls
+        if: github.event_name == 'push'
+        uses: coverallsapp/github-action@v2
+        with:
+          file: coverage/lcov.info
+          fail-on-error: false
+
+  build:
+    name: Build Variants
+    runs-on: [self-hosted, local]
+    strategy:
+      matrix:
+        include:
+          - feature: linux
+            binary: aegis-agent
+          - feature: windows
+            binary: aegis-agent
+          - feature: lite
+            binary: aegis-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          if [ "${{ matrix.feature }}" = "linux" ]; then
+            cargo build --features linux
+          else
+            cargo build --no-default-features --features ${{ matrix.feature }}
+          fi
+      - name: Verify binary name
+        run: test -f target/debug/${{ matrix.binary }}
+
+  security:
+    name: Security Audit
+    runs-on: [self-hosted, local]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit
+      - run: cargo audit

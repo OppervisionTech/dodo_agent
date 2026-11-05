@@ -13,7 +13,7 @@
 #     aegis-agent:latest
 
 # ---------- Stage 1: Build ----------
-FROM rust:1.75-bookworm AS builder
+FROM rust:latest AS builder
 
 ARG VARIANT=linux
 ARG TARGETARCH=amd64
@@ -69,7 +69,7 @@ RUN case "${TARGETARCH}" in \
     cp "target/${TARGET}/release/aegis-agent" /aegis-agent
 
 # ---------- Stage 2: Runtime ----------
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12
 
 LABEL org.opencontainers.image.title="DoDo AegisOps Agent"
 LABEL org.opencontainers.image.description="Telemetry collection agent for DoDo AegisOps AI"
@@ -86,7 +86,5 @@ COPY --from=builder /aegis-agent /usr/local/bin/aegis-agent
 
 ENV AEGIS_CONFIG=/etc/aegis/agent.yaml
 ENV RUST_LOG=info
-
-USER nonroot:nonroot
 
 ENTRYPOINT ["/usr/local/bin/aegis-agent"]

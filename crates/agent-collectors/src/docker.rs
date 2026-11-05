@@ -16,7 +16,7 @@ use std::time::Duration;
 use agent_core::{Collector, CollectorError, Envelope, SignalType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::helpers;
 
@@ -38,6 +38,7 @@ struct ContainerListEntry {
     #[serde(rename = "State")]
     state: String,
     #[serde(rename = "Status")]
+    #[allow(dead_code)]
     status: String,
 }
 
@@ -196,9 +197,7 @@ fn decode_chunked(data: &[u8]) -> Vec<u8> {
 }
 
 async fn docker_available() -> bool {
-    tokio::net::UnixStream::connect(DOCKER_SOCKET)
-        .await
-        .is_ok()
+    tokio::net::UnixStream::connect(DOCKER_SOCKET).await.is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +259,27 @@ impl DockerCollector {
 
         let mut seen_ids: Vec<String> = Vec::new();
 
+        // stats?stream=false blocks ~2s per container (Docker waits for a
+        // second CPU sample), so fetching them one by one blows the
+        // collection timeout on hosts with a dozen+ containers. Fetch all
+        // running containers' stats concurrently up front.
+        let mut stats_by_id: HashMap<String, Result<Vec<u8>, CollectorError>> = HashMap::new();
+        {
+            let mut set = tokio::task::JoinSet::new();
+            for c in containers.iter().filter(|c| c.state == "running") {
+                let id = c.id.clone();
+                set.spawn(async move {
+                    let res = docker_get(&format!("/containers/{id}/stats?stream=false")).await;
+                    (id, res)
+                });
+            }
+            while let Some(joined) = set.join_next().await {
+                if let Ok((id, res)) = joined {
+                    stats_by_id.insert(id, res);
+                }
+            }
+        }
+
         for container in &containers {
             let short_id = &container.id[..12.min(container.id.len())];
             let name = container
@@ -281,8 +301,10 @@ impl DockerCollector {
                 running += 1;
 
                 // Get stats for running containers
-                let stats_path = format!("/containers/{}/stats?stream=false", container.id);
-                match docker_get(&stats_path).await {
+                let stats = stats_by_id
+                    .remove(&container.id)
+                    .unwrap_or_else(|| Err(CollectorError::Failed("stats task failed".into())));
+                match stats {
                     Ok(stats_body) => {
                         match serde_json::from_slice::<ContainerStats>(&stats_body) {
                             Ok(stats) => {
@@ -291,15 +313,12 @@ impl DockerCollector {
                                     .cpu_stats
                                     .cpu_usage
                                     .total_usage
-                                    .saturating_sub(
-                                        stats.precpu_stats.cpu_usage.total_usage,
-                                    );
+                                    .saturating_sub(stats.precpu_stats.cpu_usage.total_usage);
                                 let system_delta = stats
                                     .cpu_stats
                                     .system_cpu_usage
                                     .saturating_sub(stats.precpu_stats.system_cpu_usage);
-                                let num_cpus =
-                                    stats.cpu_stats.online_cpus.max(1);
+                                let num_cpus = stats.cpu_stats.online_cpus.max(1);
                                 let cpu_percent = if system_delta > 0 {
                                     (cpu_delta as f64 / system_delta as f64)
                                         * num_cpus as f64
@@ -373,17 +392,11 @@ impl DockerCollector {
 
                                 // Compute deltas
                                 let mut prev_guard = self.previous.lock().await;
-                                if let Some(prev) =
-                                    prev_guard.get(&short_id.to_string())
-                                {
-                                    let rx_delta =
-                                        total_rx.saturating_sub(prev.rx_bytes);
-                                    let tx_delta =
-                                        total_tx.saturating_sub(prev.tx_bytes);
-                                    let read_delta =
-                                        read_bytes.saturating_sub(prev.read_bytes);
-                                    let write_delta =
-                                        write_bytes.saturating_sub(prev.write_bytes);
+                                if let Some(prev) = prev_guard.get(&short_id.to_string()) {
+                                    let rx_delta = total_rx.saturating_sub(prev.rx_bytes);
+                                    let tx_delta = total_tx.saturating_sub(prev.tx_bytes);
+                                    let read_delta = read_bytes.saturating_sub(prev.read_bytes);
+                                    let write_delta = write_bytes.saturating_sub(prev.write_bytes);
 
                                     envelopes.push(helpers::metric_envelope(
                                         "docker.container.network.rx_bytes",
@@ -435,9 +448,7 @@ impl DockerCollector {
                 // Restart count (from inspect)
                 let inspect_path = format!("/containers/{}/json", container.id);
                 if let Ok(inspect_body) = docker_get(&inspect_path).await {
-                    if let Ok(inspect) =
-                        serde_json::from_slice::<ContainerInspect>(&inspect_body)
-                    {
+                    if let Ok(inspect) = serde_json::from_slice::<ContainerInspect>(&inspect_body) {
                         envelopes.push(helpers::metric_envelope(
                             "docker.container.restart_count",
                             inspect.restart_count as f64,
@@ -555,8 +566,7 @@ mod tests {
         let cpu_delta = 500_000_000u64;
         let system_delta = 10_000_000_000u64;
         let num_cpus = 4u64;
-        let percent =
-            (cpu_delta as f64 / system_delta as f64) * num_cpus as f64 * 100.0;
+        let percent = (cpu_delta as f64 / system_delta as f64) * num_cpus as f64 * 100.0;
         assert!((percent - 20.0).abs() < 0.01);
     }
 
@@ -572,9 +582,8 @@ mod tests {
     async fn collector_inactive_without_docker() {
         let collector = DockerCollector::new("test-host".to_string());
         // On CI/dev machine without Docker socket, should return empty
-        let envelopes = collector.collect().await.unwrap();
+        let _envelopes = collector.collect().await.unwrap();
         // Either empty (no docker) or has metrics (docker present)
         // Just verify it doesn't crash
-        assert!(envelopes.len() >= 0);
     }
 }

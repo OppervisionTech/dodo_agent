@@ -144,7 +144,7 @@ impl Collector for ProcessCollector {
             // Top N by Memory
             // ------------------------------------------------------------------
             let mut by_mem = processes.clone();
-            by_mem.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
+            by_mem.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes));
 
             for (rank, p) in by_mem.iter().take(self.top_n).enumerate() {
                 let pid_str = p.pid.to_string();
@@ -196,7 +196,9 @@ impl Collector for ProcessCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::MetricPayload;
     use agent_platform::common::MockPlatform;
+    use prost::Message;
 
     fn test_redaction() -> Arc<RedactionEngine> {
         Arc::new(RedactionEngine::new(&[]).expect("failed to create redaction engine"))
@@ -212,8 +214,9 @@ mod tests {
         let names: Vec<String> = envelopes
             .iter()
             .filter_map(|e| {
-                let v: serde_json::Value = serde_json::from_slice(&e.payload).ok()?;
-                v["name"].as_str().map(|s| s.to_string())
+                MetricPayload::decode(e.payload.as_slice())
+                    .ok()
+                    .map(|p| p.name)
             })
             .collect();
 

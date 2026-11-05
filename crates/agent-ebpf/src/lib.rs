@@ -1,4 +1,5 @@
 use thiserror::Error;
+#[cfg(feature = "enabled")]
 use tracing::{info, warn};
 
 #[derive(Error, Debug)]
@@ -47,6 +48,7 @@ pub enum EbpfEvent {
 /// actual kernel integration (requires Linux kernel >= 5.8 and
 /// CAP_BPF + CAP_PERFMON capabilities).
 #[cfg(feature = "enabled")]
+#[derive(Default)]
 pub struct EbpfManager {
     running: bool,
 }
@@ -54,7 +56,7 @@ pub struct EbpfManager {
 #[cfg(feature = "enabled")]
 impl EbpfManager {
     pub fn new() -> Self {
-        Self { running: false }
+        Self::default()
     }
 
     /// Check if eBPF is available on this system.
@@ -80,7 +82,7 @@ impl EbpfManager {
     /// Start eBPF programs.
     pub async fn start(
         &mut self,
-        event_tx: tokio::sync::mpsc::Sender<EbpfEvent>,
+        _event_tx: tokio::sync::mpsc::Sender<EbpfEvent>,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> EbpfResult<()> {
         if !Self::is_available() {
@@ -91,12 +93,6 @@ impl EbpfManager {
 
         info!("eBPF programs starting (stub — aya integration pending)");
         self.running = true;
-
-        // In production, this would:
-        // 1. Load BPF programs (execve tracepoint, tcp_connect kprobe, openat tracepoint)
-        // 2. Attach to kernel hooks
-        // 3. Poll ring buffers for events
-        // 4. Send events through event_tx
 
         // Stub: just wait for cancellation
         cancel_token.cancelled().await;
@@ -110,7 +106,6 @@ impl EbpfManager {
         if self.running {
             info!("unloading eBPF programs");
             self.running = false;
-            // In production: detach programs, close ring buffers
         }
     }
 
@@ -128,6 +123,7 @@ impl Drop for EbpfManager {
 
 // When eBPF feature is not enabled, provide a no-op stub
 #[cfg(not(feature = "enabled"))]
+#[derive(Default)]
 pub struct EbpfManager;
 
 #[cfg(not(feature = "enabled"))]

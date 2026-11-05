@@ -16,6 +16,8 @@ use agent_core::{Collector, CollectorError, Envelope, SignalType};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::client_config::optional_target_from_env;
+use crate::delta::counter_delta;
 use crate::helpers;
 
 const COLLECT_INTERVAL_SECS: u64 = 15;
@@ -49,13 +51,7 @@ pub struct MongodbCollector {
 
 impl MongodbCollector {
     pub fn new(host_id: String) -> Self {
-        let uri = std::env::var(URI_ENV_VAR).ok();
-
-        if uri.is_some() {
-            info!("MongoDB collector configured (URI from env)");
-        } else {
-            info!("MongoDB collector inactive (no URI configured)");
-        }
+        let uri = optional_target_from_env(URI_ENV_VAR, "MongoDB", "URI");
 
         Self {
             host_id,
@@ -108,7 +104,7 @@ impl MongodbCollector {
         let db = client.database("admin");
         let cmd = mongodb::bson::doc! { "serverStatus": 1 };
 
-        let status = match db.run_command(cmd, None).await {
+        let status = match db.run_command(cmd).await {
             Ok(doc) => doc,
             Err(e) => {
                 warn!(error = %e, "MongoDB serverStatus failed");
@@ -127,7 +123,11 @@ impl MongodbCollector {
             .and_then(|r| r.get_str("setName").ok())
             .map(|s| s.to_string());
 
-        let mut base_labels: Vec<(&str, &str)> = vec![("host_id", &self.host_id)];
+        // `service` matches the db.system / peer.service name OTEL spans use, so
+        // the metric worker files these under the same service id as the
+        // topology node (/services/{name} timeline).
+        let mut base_labels: Vec<(&str, &str)> =
+            vec![("host_id", &self.host_id), ("service", "mongodb")];
         let repl_set_str;
         if let Some(ref rs) = repl_set {
             repl_set_str = rs.clone();
@@ -162,28 +162,27 @@ impl MongodbCollector {
 
             let mut prev_guard = self.previous.lock().await;
             if let Some(prev) = prev_guard.as_ref() {
-                let d = |c: i64, p: i64| -> f64 { c.saturating_sub(p).max(0) as f64 };
                 envelopes.push(helpers::metric_envelope(
                     "mongodb.opcounters.insert",
-                    d(insert, prev.insert),
+                    counter_delta(insert, prev.insert),
                     &base_labels,
                     "counter",
                 ));
                 envelopes.push(helpers::metric_envelope(
                     "mongodb.opcounters.query",
-                    d(query, prev.query),
+                    counter_delta(query, prev.query),
                     &base_labels,
                     "counter",
                 ));
                 envelopes.push(helpers::metric_envelope(
                     "mongodb.opcounters.update",
-                    d(update, prev.update),
+                    counter_delta(update, prev.update),
                     &base_labels,
                     "counter",
                 ));
                 envelopes.push(helpers::metric_envelope(
                     "mongodb.opcounters.delete",
-                    d(delete, prev.delete),
+                    counter_delta(delete, prev.delete),
                     &base_labels,
                     "counter",
                 ));
@@ -204,16 +203,15 @@ impl MongodbCollector {
                 .unwrap_or(0);
 
             if let Some(prev) = prev_guard.as_ref() {
-                let d = |c: i64, p: i64| -> f64 { c.saturating_sub(p).max(0) as f64 };
                 envelopes.push(helpers::metric_envelope(
                     "mongodb.network.bytes_in",
-                    d(bytes_in, prev.bytes_in),
+                    counter_delta(bytes_in, prev.bytes_in),
                     &base_labels,
                     "counter",
                 ));
                 envelopes.push(helpers::metric_envelope(
                     "mongodb.network.bytes_out",
-                    d(bytes_out, prev.bytes_out),
+                    counter_delta(bytes_out, prev.bytes_out),
                     &base_labels,
                     "counter",
                 ));
@@ -261,9 +259,10 @@ impl MongodbCollector {
                         .get_i64("ts")
                         .ok()
                         .and_then(|my_ts| {
-                            primary_time.get_i64("ts").ok().map(|p_ts| {
-                                (p_ts.saturating_sub(my_ts)).max(0) as f64
-                            })
+                            primary_time
+                                .get_i64("ts")
+                                .ok()
+                                .map(|p_ts| (p_ts.saturating_sub(my_ts)).max(0) as f64)
                         })
                         .unwrap_or(0.0);
 

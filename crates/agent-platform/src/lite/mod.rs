@@ -21,7 +21,9 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::common::{is_pseudo_filesystem, tcp_state_name};
+use crate::common::{
+    is_pseudo_filesystem, resolve_machine_id, tcp_state_name, FALLBACK_HOST_ID_PATH,
+};
 use crate::*;
 
 // ---------------------------------------------------------------------------
@@ -554,7 +556,7 @@ fn collect_packages() -> PlatformResult<Vec<PackageInfo>> {
                     // Split at the last '-' that precedes a digit.
                     if let Some(idx) = line.rmatch_indices('-').find_map(|(i, _)| {
                         line.get(i + 1..i + 2).and_then(|c| {
-                            if c.chars().next().map_or(false, |ch| ch.is_ascii_digit()) {
+                            if c.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
                                 Some(i)
                             } else {
                                 None
@@ -711,11 +713,7 @@ fn build_platform_info() -> PlatformResult<PlatformInfo> {
         .trim()
         .to_string();
 
-    let machine_id = read_string("/etc/machine-id")
-        .or_else(|_| read_string("/var/lib/dbus/machine-id"))
-        .unwrap_or_else(|_| "unknown".into())
-        .trim()
-        .to_string();
+    let machine_id = resolve_machine_id(FALLBACK_HOST_ID_PATH);
 
     let os_version = read_string("/etc/os-release")
         .map(|c| {
@@ -757,7 +755,7 @@ fn build_platform_info() -> PlatformResult<PlatformInfo> {
     let total_memory = meminfo
         .lines()
         .find(|l| l.starts_with("MemTotal:"))
-        .and_then(|l| parse_meminfo_kb(l))
+        .and_then(parse_meminfo_kb)
         .map(|(_, v)| v)
         .unwrap_or(0);
 

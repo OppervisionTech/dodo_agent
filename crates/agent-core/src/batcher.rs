@@ -77,6 +77,13 @@ pub async fn run(
 
             // Priority 1: shutdown.
             () = cancel_token.cancelled() => {
+                // Drain envelopes already queued so they are not lost on shutdown.
+                while let Ok(envelope) = envelope_rx.try_recv() {
+                    buffer.push(envelope);
+                    if buffer.len() >= max_batch {
+                        flush(&batch_tx, &mut buffer).await?;
+                    }
+                }
                 tracing::info!(
                     remaining = buffer.len(),
                     "batcher shutting down, flushing remaining envelopes"

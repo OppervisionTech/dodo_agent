@@ -223,7 +223,20 @@ impl Collector for DiskCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::MetricPayload;
     use agent_platform::common::MockPlatform;
+    use prost::Message;
+
+    fn metric_names(envelopes: &[Envelope]) -> Vec<String> {
+        envelopes
+            .iter()
+            .filter_map(|e| {
+                MetricPayload::decode(e.payload.as_slice())
+                    .ok()
+                    .map(|p| p.name)
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn collects_disk_space_metrics() {
@@ -234,14 +247,7 @@ mod tests {
         assert!(result.is_ok());
         let envelopes = result.unwrap();
 
-        let names: Vec<String> = envelopes
-            .iter()
-            .filter_map(|e| {
-                let v: serde_json::Value = serde_json::from_slice(&e.payload).ok()?;
-                v["name"].as_str().map(|s| s.to_string())
-            })
-            .collect();
-
+        let names = metric_names(&envelopes);
         assert!(names.contains(&"disk.space.total.bytes".to_string()));
         assert!(names.contains(&"disk.space.used.bytes".to_string()));
         assert!(names.contains(&"disk.space.usage.percent".to_string()));
@@ -257,14 +263,7 @@ mod tests {
         // Second tick: should produce I/O deltas
         let envelopes = collector.collect().await.unwrap();
 
-        let names: Vec<String> = envelopes
-            .iter()
-            .filter_map(|e| {
-                let v: serde_json::Value = serde_json::from_slice(&e.payload).ok()?;
-                v["name"].as_str().map(|s| s.to_string())
-            })
-            .collect();
-
+        let names = metric_names(&envelopes);
         // MockPlatform returns same values, so deltas will be 0, but metrics should still exist
         assert!(names.contains(&"disk.io.read.bytes".to_string()));
         assert!(names.contains(&"disk.io.write.bytes".to_string()));

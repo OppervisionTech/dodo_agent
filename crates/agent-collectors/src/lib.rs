@@ -4,6 +4,8 @@
 //! registered with the scheduler at agent startup. Collectors are
 //! independent modules that can be enabled/disabled via config.
 
+pub mod client_config;
+pub mod delta;
 pub mod helpers;
 
 pub mod certs;
@@ -23,10 +25,10 @@ pub mod self_metrics;
 // Feature-gated collectors (HU260-263)
 #[cfg(feature = "docker")]
 pub mod docker;
-#[cfg(feature = "postgres")]
-pub mod postgres;
 #[cfg(feature = "mongodb")]
 pub mod mongodb_collector;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 #[cfg(feature = "redis-collector")]
 pub mod redis_collector;
 
@@ -47,9 +49,9 @@ pub use self_metrics::SelfMetricsCollector;
 
 #[cfg(feature = "docker")]
 pub use docker::DockerCollector;
-#[cfg(feature = "postgres")]
-pub use postgres::PostgresCollector;
 #[cfg(feature = "mongodb")]
 pub use mongodb_collector::MongodbCollector;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresCollector;
 #[cfg(feature = "redis-collector")]
 pub use redis_collector::RedisCollector;
