@@ -173,7 +173,9 @@ jobs:
       - uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # amd64 only, like agent-cd-local: the arm64 build under QEMU fails
+          # compiling ring for musl.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -183,7 +185,9 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, docker]
+    # Binaries only: a broken image build must not block the downloads that
+    # get.sh depends on.
+    needs: [build-binaries]
     steps:
       - uses: actions/checkout@v4
 
