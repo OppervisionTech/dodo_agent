@@ -201,8 +201,13 @@ jobs:
       - name: Copy install script
         run: cp scripts/install.sh release/install.sh
 
+      # Binaries go to the public releases repo: dodo_agent is private, so its
+      # own release assets are not downloadable by customers. get.sh reads
+      # from OppervisionTech/dodo-agent-releases.
       - uses: softprops/action-gh-release@v2
         with:
+          repository: OppervisionTech/dodo-agent-releases
+          token: ${{ secrets.RELEASES_TOKEN }}
           files: release/*
           body: |
             ## Platform Support
@@ -219,7 +224,7 @@ jobs:
 
             **Linux:**
             ```bash
-            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo bash
+            curl -fsSL https://dodo.oppervision.com.br/agent | sudo bash -s -- --mode server --api-key $DODO_API_KEY
             ```
 
             **Docker:**
@@ -237,4 +242,4 @@ jobs:
             ```
 
             ## What's Changed
-            See [CHANGELOG.md](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md)
+            See the changelog at https://dodo.oppervision.com.br/pt/changelog/

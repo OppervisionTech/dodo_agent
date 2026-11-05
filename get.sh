@@ -3,10 +3,10 @@
 # DoDo AegisOps Agent — Universal Install Script
 #
 # Usage:
-#   curl -fsSL https://get.aegisops.io/agent | bash
-#   curl -fsSL https://get.aegisops.io/agent | bash -s -- --mode dev --api-key MY_KEY
-#   curl -fsSL https://get.aegisops.io/agent | bash -s -- --mode server --api-key MY_KEY
-#   curl -fsSL https://get.aegisops.io/agent | bash -s -- --mode k8s --api-key MY_KEY
+#   curl -fsSL https://dodo.oppervision.com.br/agent | sudo bash
+#   curl -fsSL https://dodo.oppervision.com.br/agent | sudo bash -s -- --mode dev --api-key MY_KEY
+#   curl -fsSL https://dodo.oppervision.com.br/agent | sudo bash -s -- --mode server --api-key MY_KEY
+#   curl -fsSL https://dodo.oppervision.com.br/agent | sudo bash -s -- --mode k8s --api-key MY_KEY
 #
 # All flags can also be set via env vars:
 #   DODO_MODE, DODO_API_KEY, DODO_ENDPOINT, DODO_VARIANT, DODO_VERSION,
@@ -17,7 +17,7 @@ set -euo pipefail
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 readonly SCRIPT_VERSION="0.1.0"
-readonly GITHUB_REPO="oppervision/dodo_agent"
+readonly GITHUB_REPO="OppervisionTech/dodo-agent-releases"
 readonly GITHUB_RELEASES_BASE="https://github.com/${GITHUB_REPO}/releases"
 readonly DOCKER_IMAGE="ghcr.io/oppervisiontech/aegis-agent"
 readonly HELM_OCI_CHART="oci://ghcr.io/oppervisiontech/charts/aegis-agent"
@@ -160,7 +160,8 @@ prompt_if_empty() {
     return 0
   fi
 
-  if [[ "${DODO_NON_INTERACTIVE}" == "true" ]]; then
+  # `curl ... | bash`: stdin is the script itself, so never read prompts from it.
+  if [[ "${DODO_NON_INTERACTIVE}" == "true" || ! -t 0 ]]; then
     if [[ -n "${default_val}" ]]; then
       eval "${var_name}=\"\${default_val}\""
     fi
@@ -169,6 +170,8 @@ prompt_if_empty() {
 
   local input=""
   if [[ "${secret}" == "true" ]]; then
+    local xtrace_was_on=false
+    [[ $- == *x* ]] && xtrace_was_on=true
     set +x
     if [[ -n "${default_val}" ]]; then
       read -rsp "  ${prompt_text} [${default_val}]: " input
@@ -176,7 +179,7 @@ prompt_if_empty() {
       read -rsp "  ${prompt_text}: " input
     fi
     printf "\n"
-    set -x 2>/dev/null || true
+    [[ "${xtrace_was_on}" == "true" ]] && set -x
   else
     if [[ -n "${default_val}" ]]; then
       read -rp "  ${prompt_text} [${default_val}]: " input
@@ -252,7 +255,9 @@ _download_binary() {
   local bin_name="aegis-agent"
   [[ "${DODO_VARIANT}" == "lite" ]] && bin_name="aegis-agent-lite"
 
-  local archive="${bin_name}-${ARCH}.tar.gz"
+  # Release assets: aegis-agent-linux-<arch>.tar.gz / aegis-agent-lite-<arch>.tar.gz
+  local archive="aegis-agent-linux-${ARCH}.tar.gz"
+  [[ "${DODO_VARIANT}" == "lite" ]] && archive="aegis-agent-lite-${ARCH}.tar.gz"
   local base_url
   if [[ "${DODO_VERSION}" == "latest" ]]; then
     base_url="${GITHUB_RELEASES_BASE}/latest/download"
@@ -536,7 +541,7 @@ _write_systemd_unit() {
   cat > /etc/systemd/system/aegis-agent.service << 'UNIT'
 [Unit]
 Description=DoDo AegisOps Agent - Telemetry Collection
-Documentation=https://docs.aegisops.io/agent
+Documentation=https://dodo.oppervision.com.br/pt/docs/quickstart/
 After=network-online.target
 Wants=network-online.target
 
@@ -585,7 +590,7 @@ server() {
   check_deps_server
 
   prompt_if_empty DODO_API_KEY  "API Key"                          ""                     "true"
-  prompt_if_empty DODO_ENDPOINT "AegisOps gRPC endpoint"          "kong.aegisops.io:443"
+  prompt_if_empty DODO_ENDPOINT "AegisOps gRPC endpoint"          "grpc.stg.dodo.oppervision.com.br:443"
   prompt_if_empty DODO_VERSION  "Agent version"                   "latest"
 
   [[ -n "${DODO_API_KEY}" ]] || error "API key is required for server mode. Use --api-key or set DODO_API_KEY."
@@ -708,7 +713,7 @@ k8s() {
   check_deps_k8s
 
   prompt_if_empty DODO_API_KEY    "API Key"                                ""                     "true"
-  prompt_if_empty DODO_ENDPOINT   "gRPC endpoint"                         "kong.aegisops.io:443"
+  prompt_if_empty DODO_ENDPOINT   "gRPC endpoint"                         "grpc.stg.dodo.oppervision.com.br:443"
   prompt_if_empty DODO_NAMESPACE  "Kubernetes namespace"                  "dodo"
   prompt_if_empty DODO_TLS_SECRET "TLS secret name (leave blank to skip)" ""
 
