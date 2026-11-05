@@ -259,6 +259,9 @@ _download_binary() {
   local archive="aegis-agent-linux-${ARCH}.tar.gz"
   [[ "${DODO_VARIANT}" == "lite" ]] && archive="aegis-agent-lite-${ARCH}.tar.gz"
   local base_url
+  if [[ "${DODO_VERSION}" != "latest" && ! "${DODO_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    error "Invalid --version '${DODO_VERSION}'. Expected 'latest' or a tag like v0.1.0"
+  fi
   if [[ "${DODO_VERSION}" == "latest" ]]; then
     base_url="${GITHUB_RELEASES_BASE}/latest/download"
   else
@@ -276,10 +279,10 @@ _download_binary() {
 
   if curl -fsSL "${base_url}/${archive}.sha256" -o "${tmp}/check.sha256" 2>/dev/null; then
     info "Verifying checksum..."
-    (cd "${tmp}" && printf '%s  archive.tar.gz\n' "$(cat check.sha256)" | sha256sum -c -)
+    (cd "${tmp}" && printf '%s  archive.tar.gz\n' "$(awk '{print $1}' check.sha256)" | sha256sum -c -)
     ok "Checksum verified"
   else
-    warn "Checksum file not available — skipping verification"
+    error "Checksum file not available at ${base_url}/${archive}.sha256 — refusing to install an unverified binary"
   fi
 
   tar -xzf "${tmp}/archive.tar.gz" -C "${tmp}"
@@ -527,11 +530,12 @@ YAML
 }
 
 _write_agent_env() {
+  local xtrace_was_on=false
+  [[ $- == *x* ]] && xtrace_was_on=true
   set +x
-  cat > "${CONFIG_DIR}/agent.env" << ENV
-DODO_API_KEY=${DODO_API_KEY}
-ENV
-  set -x 2>/dev/null || true
+  # umask 077: the file is never readable by others, not even briefly.
+  ( umask 077; printf 'DODO_API_KEY=%s\n' "${DODO_API_KEY}" > "${CONFIG_DIR}/agent.env" )
+  [[ "${xtrace_was_on}" == "true" ]] && set -x
   chmod 600 "${CONFIG_DIR}/agent.env"
   chown "root:${SERVICE_USER}" "${CONFIG_DIR}/agent.env" 2>/dev/null || true
   ok "Agent env file written: ${CONFIG_DIR}/agent.env (mode 600)"
@@ -733,9 +737,13 @@ k8s() {
   ok "Namespace ready"
 
   step "Creating API key secret"
+  local key_file
+  key_file="$(mktemp)"   # mktemp creates it 0600
+  printf '%s' "${DODO_API_KEY}" > "${key_file}"
   kubectl -n "${DODO_NAMESPACE}" create secret generic aegis-agent-credentials \
-    --from-literal=api-key="${DODO_API_KEY}" \
+    --from-file=api-key="${key_file}" \
     --dry-run=client -o yaml | kubectl apply -f -
+  rm -f "${key_file}"
   ok "Secret 'aegis-agent-credentials' applied"
 
   step "Deploying via Helm (version=${DODO_VERSION})"
@@ -860,17 +868,21 @@ dev() {
   docker pull "${DOCKER_IMAGE}:${docker_tag}"
 
   step "Starting agent container"
+  local env_file
+  env_file="$(mktemp)"   # 0600; keeps the key out of `ps` and docker inspect args
+  printf 'DODO_API_KEY=%s\n' "${DODO_API_KEY}" > "${env_file}"
   docker run -d \
     --name "${container_name}" \
     --restart unless-stopped \
-    -p 4317:4317 \
-    -p 4318:4318 \
-    -p "${HEALTH_PORT}:${HEALTH_PORT}" \
+    -p 127.0.0.1:4317:4317 \
+    -p 127.0.0.1:4318:4318 \
+    -p "127.0.0.1:${HEALTH_PORT}:${HEALTH_PORT}" \
     -v "${config_file}:/etc/aegis/agent.yaml:ro" \
     -e "AEGIS_CONFIG=/etc/aegis/agent.yaml" \
     -e "RUST_LOG=info" \
-    -e "DODO_API_KEY=${DODO_API_KEY}" \
+    --env-file "${env_file}" \
     "${DOCKER_IMAGE}:${docker_tag}"
+  rm -f "${env_file}"
 
   ok "Container started: ${container_name}"
 
