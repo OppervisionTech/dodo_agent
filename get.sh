@@ -16,7 +16,7 @@ set -euo pipefail
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="0.3.0"
+readonly SCRIPT_VERSION="0.3.1"
 readonly GITHUB_REPO="OppervisionTech/dodo-agent-releases"
 readonly GITHUB_RELEASES_BASE="https://github.com/${GITHUB_REPO}/releases"
 readonly DOCKER_IMAGE="ghcr.io/oppervisiontech/aegis-agent"
@@ -391,7 +391,7 @@ _write_server_config() {
 
 endpoint:
   address: "${DODO_ENDPOINT}"
-  timeout_ms: 5000
+  timeout_ms: 15000
   retry_max: 3
   retry_backoff_ms: 1000
 
@@ -411,7 +411,7 @@ buffer:
   path: "${BUFFER_DIR}"
   max_size_bytes: 536870912
   flush_interval_ms: 5000
-  max_batch_size: 500
+  max_batch_size: 200
 
 logging:
   level: "info"
@@ -515,7 +515,7 @@ _write_dev_config() {
 
 endpoint:
   address: "${DODO_ENDPOINT}"
-  timeout_ms: 5000
+  timeout_ms: 15000
   retry_max: 3
   retry_backoff_ms: 1000
 
