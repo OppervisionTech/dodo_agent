@@ -20,7 +20,10 @@ use tracing::{debug, info};
 
 use crate::helpers;
 
+#[cfg(unix)]
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
+#[cfg(windows)]
+const DOCKER_SOCKET: &str = r"\\.\pipe\docker_engine";
 const COLLECT_INTERVAL_SECS: u64 = 10;
 
 // ---------------------------------------------------------------------------
@@ -121,11 +124,27 @@ struct PreviousContainerState {
 }
 
 // ---------------------------------------------------------------------------
-// Docker API client (raw HTTP over Unix socket)
+// Docker API client (raw HTTP over the Unix socket, or the named pipe on Windows)
 // ---------------------------------------------------------------------------
 
+/// Bidirectional byte stream to the Docker Engine API.
+trait DockerStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> DockerStream for T {}
+
+#[cfg(unix)]
+async fn connect_docker() -> std::io::Result<Box<dyn DockerStream>> {
+    let stream = tokio::net::UnixStream::connect(DOCKER_SOCKET).await?;
+    Ok(Box::new(stream))
+}
+
+#[cfg(windows)]
+async fn connect_docker() -> std::io::Result<Box<dyn DockerStream>> {
+    let pipe = tokio::net::windows::named_pipe::ClientOptions::new().open(DOCKER_SOCKET)?;
+    Ok(Box::new(pipe))
+}
+
 async fn docker_get(path: &str) -> Result<Vec<u8>, CollectorError> {
-    let mut stream = tokio::net::UnixStream::connect(DOCKER_SOCKET)
+    let mut stream = connect_docker()
         .await
         .map_err(|e| CollectorError::Io(e.to_string()))?;
 
@@ -197,7 +216,7 @@ fn decode_chunked(data: &[u8]) -> Vec<u8> {
 }
 
 async fn docker_available() -> bool {
-    tokio::net::UnixStream::connect(DOCKER_SOCKET).await.is_ok()
+    connect_docker().await.is_ok()
 }
 
 // ---------------------------------------------------------------------------

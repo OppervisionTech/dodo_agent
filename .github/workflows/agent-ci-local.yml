@@ -49,6 +49,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --features linux --all
 
+  windows-cross:
+    name: Windows cross build
+    # Hosted runner: needs the mingw-w64 toolchain, which the local runner
+    # does not have. Building for the real target catches unix-only code that
+    # the linux-hosted `--features windows` builds miss.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-cross
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - run: cargo clippy --target x86_64-pc-windows-gnu --no-default-features --features windows -- -D warnings
+
   coverage:
     name: Code Coverage
     runs-on: [self-hosted, local]
