@@ -1,193 +1,176 @@
 #!/usr/bin/env bash
-#
-# DoDo AegisOps Agent — Installation Script
-#
-# Local install (from build or extracted archive):
-#   sudo ./install.sh [linux|lite]
-#
-# One-liner install (downloads from GitHub Releases):
-#   curl -fsSL https://releases.aegisops.io/install.sh | sudo bash -s -- [--version v0.1.0] [--variant linux|lite]
-#
+# Canonical, versioned Linux installer. Published as both get.sh and install.sh.
+# Supply endpoints from the environment's installation manifest; no legacy hosts.
 set -euo pipefail
+set +x
+readonly GITHUB_REPO="OppervisionTech/dodo_agent"
+readonly DOCKER_IMAGE="ghcr.io/oppervisiontech/aegis-agent"
+DODO_MODE="${DODO_MODE:-server}"
+DODO_API_KEY="${DODO_API_KEY:-}"
+DODO_ENDPOINT="${DODO_ENDPOINT:-grpc.stg.dodo.oppervision.com.br:443}"
+DODO_ENROLLMENT_ENDPOINT="${DODO_ENROLLMENT_ENDPOINT:-https://api.stg.dodo.oppervision.com.br/v1/enroll}"
+DODO_VERSION="${DODO_VERSION:-}"
+DODO_VARIANT="${DODO_VARIANT:-linux}"
+INSTALL_TMP=""
+error() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+cleanup() { [[ -z "$INSTALL_TMP" ]] || rm -rf "$INSTALL_TMP"; }
+trap cleanup EXIT
 
-GITHUB_REPO="oppervision/dodo_agent"
-VARIANT=""
-VERSION="latest"
-INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/aegis"
-DATA_DIR="/var/lib/aegis"
-BUFFER_DIR="${DATA_DIR}/buffer"
-CERTS_DIR="${CONFIG_DIR}/certs"
-LOG_DIR="/var/log/aegis"
-SERVICE_USER="aegis-agent"
-BINARY_NAME="aegis-agent"
-
-# Parse arguments
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --version)  VERSION="$2"; shift 2 ;;
-        --variant)  VARIANT="$2"; shift 2 ;;
-        linux|lite) VARIANT="$1"; shift ;;
-        *)          echo "Unknown option: $1"; exit 1 ;;
+parse_args() {
+  while (($#)); do
+    local option="$1" value=""
+    if [[ "$option" == *=* ]]; then value="${option#*=}"; option="${option%%=*}"; shift
+    else
+      case "$option" in
+        --non-interactive) shift; continue ;;
+        --help|-h) printf 'Usage: get.sh --version vX.Y.Z --endpoint host:443 --enrollment-endpoint https://host/v1/enroll [--api-key KEY] [--mode server|dev] [--variant linux|lite]\n'; return 0 ;;
+      esac
+      (($# >= 2)) && [[ "$2" != --* ]] || error "Missing value for $option"
+      value="$2"; shift 2
+    fi
+    [[ -n "$value" ]] || error "Empty value for $option"
+    case "$option" in
+      --mode) DODO_MODE="$value" ;;
+      --api-key) DODO_API_KEY="$value" ;;
+      --endpoint) DODO_ENDPOINT="$value" ;;
+      --enrollment-endpoint) DODO_ENROLLMENT_ENDPOINT="$value" ;;
+      --version) DODO_VERSION="$value" ;;
+      --variant) DODO_VARIANT="$value" ;;
+      *) error "Unknown option: $option" ;;
     esac
-done
-
-# Detect architecture and set defaults
-ARCH="$(uname -m)"
-case "${ARCH}" in
-    x86_64|amd64)  ARCH_LABEL="amd64" ;;
-    aarch64|arm64) ARCH_LABEL="arm64" ;;
-    *)             echo "ERROR: Unsupported architecture: ${ARCH}"; exit 1 ;;
-esac
-
-if [[ -z "${VARIANT}" ]]; then
-    VARIANT="linux"
-fi
-
-if [[ "${VARIANT}" == "lite" ]]; then
-    BINARY_NAME="aegis-agent-lite"
-fi
-
-echo "=== DoDo AegisOps Agent Installer ==="
-echo "Variant: ${VARIANT}"
-echo "Arch:    ${ARCH_LABEL}"
-echo "Version: ${VERSION}"
-echo ""
-
-# Check root
-if [[ $EUID -ne 0 ]]; then
-    echo "ERROR: This script must be run as root (sudo)"
-    exit 1
-fi
-
-# Create system user (no login shell, no home)
-if ! id "${SERVICE_USER}" &>/dev/null; then
-    echo "Creating user ${SERVICE_USER}..."
-    useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
-fi
-
-# Create directories
-echo "Creating directories..."
-mkdir -p "${INSTALL_DIR}"
-mkdir -p "${CONFIG_DIR}"
-mkdir -p "${CERTS_DIR}"
-mkdir -p "${DATA_DIR}"
-mkdir -p "${BUFFER_DIR}"
-mkdir -p "${LOG_DIR}"
-
-# Find or download binary
-install_binary() {
-    # 1. Check local binary in current directory
-    if [[ -f "./${BINARY_NAME}" ]]; then
-        echo "Installing binary from current directory..."
-        cp "./${BINARY_NAME}" "${INSTALL_DIR}/aegis-agent"
-        return 0
-    fi
-
-    # 2. Check target/release from build
-    if [[ -f "target/release/${BINARY_NAME}" ]]; then
-        echo "Installing binary from build output..."
-        cp "target/release/${BINARY_NAME}" "${INSTALL_DIR}/aegis-agent"
-        return 0
-    fi
-
-    # 3. Check dist/ from build.sh
-    local dist_variant="${VARIANT}-${ARCH_LABEL}"
-    if [[ -f "dist/${dist_variant}/${BINARY_NAME}" ]]; then
-        echo "Installing binary from dist/..."
-        cp "dist/${dist_variant}/${BINARY_NAME}" "${INSTALL_DIR}/aegis-agent"
-        return 0
-    fi
-
-    # 4. Download from GitHub Releases
-    echo "Downloading from GitHub Releases..."
-    command -v curl >/dev/null 2>&1 || { echo "ERROR: curl required for download"; exit 1; }
-
-    local download_url
-    local archive_name="aegis-agent-${VARIANT}-${ARCH_LABEL}.tar.gz"
-    if [[ "${VERSION}" == "latest" ]]; then
-        download_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${archive_name}"
-    else
-        download_url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${archive_name}"
-    fi
-
-    local tmp_dir
-    tmp_dir="$(mktemp -d)"
-    trap 'rm -rf "${tmp_dir}"' EXIT
-
-    echo "  URL: ${download_url}"
-    curl -fSL "${download_url}" -o "${tmp_dir}/archive.tar.gz"
-
-    # Verify checksum if available
-    local checksum_url="${download_url}.sha256"
-    if curl -fsSL "${checksum_url}" -o "${tmp_dir}/checksum.sha256" 2>/dev/null; then
-        echo "Verifying checksum..."
-        (cd "${tmp_dir}" && echo "$(cat checksum.sha256)  archive.tar.gz" | sha256sum -c -)
-    fi
-
-    tar -xzf "${tmp_dir}/archive.tar.gz" -C "${tmp_dir}"
-    cp "${tmp_dir}/${BINARY_NAME}" "${INSTALL_DIR}/aegis-agent"
-    return 0
+  done
 }
-
-install_binary
-chmod 755 "${INSTALL_DIR}/aegis-agent"
-
-# Set capabilities (instead of running as root)
-echo "Setting capabilities..."
-setcap 'cap_bpf,cap_perfmon,cap_net_raw,cap_dac_read_search=eip' "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null || \
-    echo "WARNING: Failed to set capabilities. Agent may need to run as root."
-
-# Copy default config
-if [[ ! -f "${CONFIG_DIR}/agent.yaml" ]]; then
-    echo "Installing default configuration..."
-    if [[ -f "config/agent.yaml" ]]; then
-        cp "config/agent.yaml" "${CONFIG_DIR}/agent.yaml"
-    else
-        echo "WARNING: Default config not found, creating minimal config"
-        cat > "${CONFIG_DIR}/agent.yaml" << 'YAML'
+validate_inputs() {
+  [[ "$DODO_MODE" == server || "$DODO_MODE" == dev ]] || error 'Supported modes: server, dev (Linux host-network Docker). Use the separately versioned chart for Kubernetes.'
+  [[ "$DODO_VARIANT" == linux || "$DODO_VARIANT" == lite ]] || error 'Variant must be linux or lite'
+  [[ "$DODO_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]] || error 'An explicit published --version is required (vX.Y.Z)'
+  [[ "$DODO_ENDPOINT" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ ]] || error 'An explicit --endpoint host:port is required'
+  [[ "$DODO_ENROLLMENT_ENDPOINT" =~ ^https://[a-zA-Z0-9.-]+(:[0-9]+)?/v1/enroll$ ]] || error 'An explicit HTTPS --enrollment-endpoint ending /v1/enroll is required'
+  [[ "$DODO_API_KEY" =~ ^dodo_[a-fA-F0-9]{64}$ ]] || error 'A valid DODO_API_KEY or --api-key is required'
+  DODO_VERSION="v${DODO_VERSION#v}"
+}
+verify_checksum() {
+  local archive="$1" checksum_file="$2" expected actual
+  expected="$(awk 'NR==1 {print $1}' "$checksum_file")"
+  [[ "$expected" =~ ^[a-fA-F0-9]{64}$ ]] || error 'Invalid SHA256 checksum file'
+  actual="$(sha256sum "$archive")"; actual="${actual%% *}"
+  [[ "$(printf %s "$actual" | tr A-F a-f)" == "$(printf %s "$expected" | tr A-F a-f)" ]] || error 'SHA256 mismatch; refusing installation'
+}
+download_binary() {
+  local arch="$1" variant="aegis-agent-linux" binary="aegis-agent"
+  if [[ "$DODO_VARIANT" == lite ]]; then variant="aegis-agent-lite"; binary="aegis-agent-lite"; fi
+  local archive="${variant}-${arch}.tar.gz"
+  local base="https://github.com/${GITHUB_REPO}/releases/download/${DODO_VERSION}"
+  INSTALL_TMP="$(mktemp -d)"
+  curl --proto '=https' --tlsv1.2 -fsSL "$base/$archive" -o "$INSTALL_TMP/archive.tar.gz"
+  curl --proto '=https' --tlsv1.2 -fsSL "$base/$archive.sha256" -o "$INSTALL_TMP/check.sha256"
+  verify_checksum "$INSTALL_TMP/archive.tar.gz" "$INSTALL_TMP/check.sha256"
+  [[ "$(tar -tzf "$INSTALL_TMP/archive.tar.gz")" == "$binary" ]] || error 'Unexpected archive contents'
+  tar -xzf "$INSTALL_TMP/archive.tar.gz" -C "$INSTALL_TMP"
+  [[ -f "$INSTALL_TMP/$binary" && ! -L "$INSTALL_TMP/$binary" ]] || error 'Archive does not contain a regular binary'
+  install -m 755 "$INSTALL_TMP/$binary" /usr/local/bin/aegis-agent
+}
+write_config() {
+  local dir="$1"
+  mkdir -p "$dir"
+  cat > "$dir/agent.yaml" <<YAML
 endpoint:
-  address: "grpc.stg.dodo.oppervision.com.br:443"
-logging:
-  level: "info"
+  address: "$DODO_ENDPOINT"
+enrollment_endpoint: "$DODO_ENROLLMENT_ENDPOINT"
+tls:
+  enabled: true
+  ca_cert_path: /var/lib/aegis/certs/ca.pem
+  client_cert_path: /var/lib/aegis/certs/agent.pem
+  client_key_path: /var/lib/aegis/certs/agent-key.pem
+  verify_server: true
+buffer:
+  path: /var/lib/aegis/buffer
+agent_id_path: /var/lib/aegis/agent_id
+collectors:
+  - {name: cpu, enabled: true, interval_seconds: 5}
+  - {name: memory, enabled: true, interval_seconds: 5}
+  - {name: disk, enabled: true, interval_seconds: 10}
+  - {name: network, enabled: true, interval_seconds: 5}
+  - {name: inventory, enabled: true, interval_seconds: 3600}
+  - {name: heartbeat, enabled: true, interval_seconds: 30}
+  - {name: self_metrics, enabled: true, interval_seconds: 30}
+  - {name: otel, enabled: true, interval_seconds: 1}
 YAML
+  (umask 077; printf 'DODO_API_KEY=%s\n' "$DODO_API_KEY" > "$dir/agent.env")
+}
+write_unit() {
+  cat > /etc/systemd/system/aegis-agent.service <<'UNIT'
+[Unit]
+Description=DoDo AegisOps Agent
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=aegis-agent
+Group=aegis-agent
+ExecStart=/usr/local/bin/aegis-agent
+WorkingDirectory=/var/lib/aegis
+Environment=AEGIS_CONFIG=/etc/aegis/agent.yaml
+EnvironmentFile=/etc/aegis/agent.env
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/aegis /var/log/aegis
+ReadOnlyPaths=/etc/aegis
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+main() {
+  if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then parse_args "$1"; return; fi
+  parse_args "$@"
+  validate_inputs
+  [[ "$(uname -s)" == Linux ]] || error 'This installer requires Linux. Docker Desktop requires an explicitly supported collector deployment.'
+  local arch
+  case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) error 'Unsupported architecture' ;; esac
+  if [[ "$DODO_MODE" == dev ]]; then
+    [[ "$DODO_VARIANT" == linux ]] || error 'Docker mode supports the standard image'
+    command -v docker >/dev/null || error 'Docker is required'
+    local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/dodo-agent"
+    (umask 077; write_config "$config_dir")
+    docker volume create dodo-agent-data >/dev/null
+    docker run -d --name dodo-agent --restart unless-stopped --network host \
+      --env-file "$config_dir/agent.env" -v "$config_dir:/etc/aegis:ro" \
+      -v dodo-agent-data:/var/lib/aegis "$DOCKER_IMAGE:${DODO_VERSION#v}"
+    printf 'Local collector: http://127.0.0.1:4318/healthz. State persists in dodo-agent-data.\n'
+    return
+  fi
+  [[ "$EUID" == 0 ]] || error 'Server mode requires root (sudo)'
+  for cmd in curl tar sha256sum systemctl useradd; do command -v "$cmd" >/dev/null || error "Missing dependency: $cmd"; done
+  # Validate/download before changing service configuration. A failed artifact does
+  # not stop a previously healthy agent.
+  download_binary "$arch"
+  id aegis-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin aegis-agent
+  install -d -m 750 -o root -g aegis-agent /etc/aegis
+  install -d -m 700 -o aegis-agent -g aegis-agent /var/lib/aegis /var/lib/aegis/certs /var/lib/aegis/buffer /var/log/aegis
+  # Upgrade legacy cert locations without changing the enrolled key/identity.
+  for name in ca.pem agent.pem agent-key.pem; do
+    if [[ ! -e /var/lib/aegis/certs/$name && -f /etc/aegis/certs/$name && ! -L /etc/aegis/certs/$name ]]; then
+      install -m 600 -o aegis-agent -g aegis-agent "/etc/aegis/certs/$name" "/var/lib/aegis/certs/$name"
     fi
-fi
-
-# Set ownership
-echo "Setting permissions..."
-chown -R "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}"
-chown -R "${SERVICE_USER}:${SERVICE_USER}" "${LOG_DIR}"
-chown -R root:${SERVICE_USER} "${CONFIG_DIR}"
-chmod 750 "${CONFIG_DIR}"
-chmod 640 "${CONFIG_DIR}/agent.yaml"
-chmod 700 "${CERTS_DIR}"
-
-# Install systemd service
-if command -v systemctl &>/dev/null; then
-    echo "Installing systemd service..."
-    if [[ -f "systemd/aegis-agent.service" ]]; then
-        cp "systemd/aegis-agent.service" /etc/systemd/system/aegis-agent.service
-    fi
-    systemctl daemon-reload
-    systemctl enable aegis-agent
-    echo "Service installed. Start with: systemctl start aegis-agent"
-fi
-
-# Generate SHA256 checksum
-echo ""
-echo "Binary checksum:"
-sha256sum "${INSTALL_DIR}/${BINARY_NAME}"
-
-echo ""
-echo "=== Installation Complete ==="
-echo ""
-echo "Next steps:"
-echo "  1. Place TLS certificates in ${CERTS_DIR}/"
-echo "     - ca.pem (CA certificate)"
-echo "     - agent.pem (client certificate)"
-echo "     - agent-key.pem (client private key)"
-echo "  2. Edit ${CONFIG_DIR}/agent.yaml with your endpoint address"
-echo "  3. Start the agent: systemctl start aegis-agent"
-echo "  4. Check status: systemctl status aegis-agent"
-echo "  5. View logs: journalctl -u aegis-agent -f"
+  done
+  write_config /etc/aegis
+  chown root:aegis-agent /etc/aegis/agent.yaml /etc/aegis/agent.env
+  chmod 640 /etc/aegis/agent.yaml
+  chmod 600 /etc/aegis/agent.env
+  write_unit
+  systemctl daemon-reload
+  systemctl enable --now aegis-agent
+  systemctl restart aegis-agent
+  printf 'Installed %s. Diagnose: systemctl status aegis-agent; journalctl -u aegis-agent. Collector health: http://127.0.0.1:4318/healthz (not proof of backend delivery).\n' "$DODO_VERSION"
+}
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

@@ -1,30 +1,18 @@
 [Unit]
-Description=DoDo AegisOps Agent - Telemetry Collection
-Documentation=https://docs.aegisops.io/agent
+Description=DoDo AegisOps Agent
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 User=aegis-agent
 Group=aegis-agent
 ExecStart=/usr/local/bin/aegis-agent
+WorkingDirectory=/var/lib/aegis
+Environment=AEGIS_CONFIG=/etc/aegis/agent.yaml
+EnvironmentFile=/etc/aegis/agent.env
 Restart=always
 RestartSec=5
 TimeoutStopSec=15
-
-# Working directory
-WorkingDirectory=/var/lib/aegis
-
-# Environment
-Environment=AEGIS_CONFIG=/etc/aegis/agent.yaml
-Environment=RUST_LOG=info
-
-# File descriptor limits
-LimitNOFILE=65536
-LimitMEMLOCK=infinity
-
-# Hardening
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/aegis /var/log/aegis
@@ -35,10 +23,6 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-
-# Capabilities (instead of running as root)
-AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_DAC_READ_SEARCH
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_DAC_READ_SEARCH
-
+UMask=0077
 [Install]
 WantedBy=multi-user.target

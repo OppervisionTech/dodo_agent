@@ -37,11 +37,12 @@ COPY crates/agent-core/Cargo.toml crates/agent-core/
 COPY crates/agent-collectors/Cargo.toml crates/agent-collectors/
 COPY crates/agent-transport/Cargo.toml crates/agent-transport/
 COPY crates/agent-config/Cargo.toml crates/agent-config/
+COPY crates/agent-command/Cargo.toml crates/agent-command/
 COPY crates/agent-ebpf/Cargo.toml crates/agent-ebpf/
 COPY crates/agent-platform/Cargo.toml crates/agent-platform/
 
 # Create stub lib.rs files for dependency caching
-RUN for crate in agent-core agent-collectors agent-transport agent-config agent-ebpf agent-platform; do \
+RUN for crate in agent-core agent-collectors agent-transport agent-command agent-config agent-ebpf agent-platform; do \
         mkdir -p "crates/${crate}/src" && echo "" > "crates/${crate}/src/lib.rs"; \
     done && \
     mkdir -p src && echo "fn main() {}" > src/main.rs
@@ -51,7 +52,7 @@ RUN case "${TARGETARCH}" in \
         amd64) TARGET=x86_64-unknown-linux-musl ;; \
         arm64) TARGET=aarch64-unknown-linux-musl ;; \
     esac && \
-    cargo build --release --features "${VARIANT}" --target "${TARGET}" 2>/dev/null || true
+    cargo build --release --no-default-features --features "${VARIANT}" --target "${TARGET}" 2>/dev/null || true
 
 # Copy actual source
 COPY crates/ crates/
@@ -65,7 +66,7 @@ RUN case "${TARGETARCH}" in \
         amd64) TARGET=x86_64-unknown-linux-musl ;; \
         arm64) TARGET=aarch64-unknown-linux-musl ;; \
     esac && \
-    cargo build --release --features "${VARIANT}" --target "${TARGET}" && \
+    cargo build --release --no-default-features --features "${VARIANT}" --target "${TARGET}" && \
     cp "target/${TARGET}/release/aegis-agent" /aegis-agent
 
 # ---------- Stage 2: Runtime ----------
@@ -74,9 +75,10 @@ FROM gcr.io/distroless/static-debian12
 LABEL org.opencontainers.image.title="DoDo AegisOps Agent"
 LABEL org.opencontainers.image.description="Telemetry collection agent for DoDo AegisOps AI"
 LABEL org.opencontainers.image.vendor="Oppervision"
-LABEL org.opencontainers.image.source="https://github.com/oppervision/dodo_agent"
+LABEL org.opencontainers.image.source="https://github.com/OppervisionTech/dodo_agent"
 
 COPY --from=builder /aegis-agent /usr/local/bin/aegis-agent
+COPY config/agent.yaml /etc/aegis/agent.yaml
 
 # Config and data directories are expected to be mounted
 # /etc/aegis       — configuration (read-only)
