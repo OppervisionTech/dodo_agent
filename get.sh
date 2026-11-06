@@ -21,8 +21,6 @@ readonly GITHUB_REPO="OppervisionTech/dodo-agent-releases"
 readonly GITHUB_RELEASES_BASE="https://github.com/${GITHUB_REPO}/releases"
 readonly DOCKER_IMAGE="ghcr.io/oppervisiontech/aegis-agent"
 readonly HELM_OCI_CHART="oci://ghcr.io/oppervisiontech/charts/aegis-agent"
-readonly HELM_REPO_NAME="aegisops"
-readonly HELM_REPO_URL="https://charts.aegisops.io"
 readonly HEALTH_PORT="9090"
 
 # Server mode directories
@@ -784,8 +782,10 @@ _helm_deploy() {
     "--timeout" "120s"
   )
 
+  # DODO_VERSION is the agent release (vX.Y.Z); it pins the image tag, not
+  # the chart version (the chart is versioned on its own).
   if [[ "${DODO_VERSION}" != "latest" ]]; then
-    helm_args+=("--version" "${DODO_VERSION}")
+    helm_args+=("--set" "image.tag=${DODO_VERSION#v}")
   fi
 
   if [[ -n "${DODO_TLS_SECRET}" ]]; then
@@ -805,16 +805,11 @@ _helm_deploy() {
     "--set" "enrollment.endpoint=${DODO_ENROLLMENT_ENDPOINT}"
   )
 
-  info "Trying OCI registry..."
-  if helm upgrade --install aegis-agent "${HELM_OCI_CHART}" "${helm_args[@]}" 2>/dev/null; then
-    ok "Deployed via OCI registry"
-    return 0
+  info "Installing chart ${HELM_OCI_CHART}..."
+  if ! helm upgrade --install aegis-agent "${HELM_OCI_CHART}" "${helm_args[@]}"; then
+    error "Helm install failed. Check access to ghcr.io (see the helm output above) and run: kubectl -n ${DODO_NAMESPACE} get pods"
   fi
-
-  warn "OCI deploy failed — falling back to Helm repository..."
-  helm repo add "${HELM_REPO_NAME}" "${HELM_REPO_URL}" 2>/dev/null || true
-  helm repo update "${HELM_REPO_NAME}"
-  helm upgrade --install aegis-agent "${HELM_REPO_NAME}/aegis-agent" "${helm_args[@]}"
+  ok "Chart installed"
   ok "Deployed via Helm repository"
 }
 
