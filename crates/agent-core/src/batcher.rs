@@ -1,7 +1,7 @@
 //! Batcher — accumulates envelopes and flushes in batches.
 //!
 //! Implements HU014 (batching). Flushes when any of these conditions is met:
-//! - Envelope count reaches `max_batch_size` (default 500)
+//! - Envelope count reaches `max_batch_size` (default 200)
 //! - Timer expires (`flush_interval_ms`, default 5000ms)
 //! - Shutdown signal (cancellation token)
 
@@ -26,7 +26,7 @@ impl Default for BatcherConfig {
     fn default() -> Self {
         Self {
             flush_interval_ms: 5_000,
-            max_batch_size: 500,
+            max_batch_size: 200,
         }
     }
 }
