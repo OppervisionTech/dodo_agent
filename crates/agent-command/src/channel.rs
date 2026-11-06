@@ -24,12 +24,92 @@ pub struct CommandChannel {
     executor: Arc<CommandExecutor>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn shutdown_interrupts_initial_connect_and_reconnect_backoff() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        CommandChannel::new("agent".into(), TransportConfig::default())
+            .run(cancel)
+            .await;
+        let config = TransportConfig {
+            endpoint_address: "127.0.0.1:1".into(),
+            tls_enabled: false,
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let channel = CommandChannel::new("agent".into(), config);
+        let task = tokio::spawn(channel.run(cancel.clone()));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actual_stream_registers_authenticated_agent_and_cancels_without_commands() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let server = crate::test_network::grpc(move |request| {
+            assert_eq!(
+                request.uri().path(),
+                "/dodo.proto.v1.CommandService/CommandStream"
+            );
+            assert_eq!(request.headers()["authorization"], "Bearer synthetic-token");
+            assert_eq!(request.headers()["x-api-key"], "synthetic-key");
+            let registration = AgentCommandResult::decode(&request.body()[5..]).unwrap();
+            assert_eq!(registration.agent_id, "agent");
+            assert!(registration.success);
+            observed.fetch_add(1, Ordering::SeqCst);
+            (
+                0,
+                agent_transport::proto::AgentCommand {
+                    command_id: "empty-command".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+        })
+        .await;
+        let config = TransportConfig {
+            endpoint_address: server.address.clone(),
+            tls_enabled: false,
+            api_key: Some("synthetic-key".into()),
+            ..Default::default()
+        };
+        *config.agent_jwt.write().unwrap() = Some("synthetic-token".into());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(CommandChannel::new("agent".into(), config).run(cancel.clone()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
 impl CommandChannel {
     pub fn new(agent_id: String, config: TransportConfig) -> Self {
         Self {
             agent_id,
             config,
-            executor: Arc::new(CommandExecutor),
+            executor: Arc::new(CommandExecutor::default()),
         }
     }
 

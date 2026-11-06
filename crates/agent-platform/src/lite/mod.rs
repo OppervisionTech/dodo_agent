@@ -26,6 +26,11 @@ use crate::common::{
 };
 use crate::*;
 
+// statvfs counter widths vary with the libc target; widen without truncation.
+fn filesystem_count(value: impl Into<u64>) -> u64 {
+    value.into()
+}
+
 // ---------------------------------------------------------------------------
 // Public struct
 // ---------------------------------------------------------------------------
@@ -211,9 +216,9 @@ fn collect_disk_spaces() -> PlatformResult<Vec<DiskSpace>> {
             continue; // permission denied or unmounted — skip silently
         }
 
-        let bsize = stat.f_frsize as u64;
-        let total = (stat.f_blocks as u64) * bsize;
-        let free = (stat.f_bfree as u64) * bsize;
+        let bsize = filesystem_count(stat.f_frsize);
+        let total = filesystem_count(stat.f_blocks) * bsize;
+        let free = filesystem_count(stat.f_bfree) * bsize;
 
         result.push(DiskSpace {
             mount_point: mount.to_string(),
@@ -222,8 +227,9 @@ fn collect_disk_spaces() -> PlatformResult<Vec<DiskSpace>> {
             total_bytes: total,
             used_bytes: total.saturating_sub(free),
             free_bytes: free,
-            inodes_total: stat.f_files as u64,
-            inodes_used: (stat.f_files as u64).saturating_sub(stat.f_ffree as u64),
+            inodes_total: filesystem_count(stat.f_files),
+            inodes_used: filesystem_count(stat.f_files)
+                .saturating_sub(filesystem_count(stat.f_ffree)),
         });
     }
     Ok(result)
@@ -713,7 +719,7 @@ fn build_platform_info() -> PlatformResult<PlatformInfo> {
         .trim()
         .to_string();
 
-    let machine_id = resolve_machine_id(FALLBACK_HOST_ID_PATH);
+    let machine_id = resolve_machine_id(FALLBACK_HOST_ID_PATH)?;
 
     let os_version = read_string("/etc/os-release")
         .map(|c| {

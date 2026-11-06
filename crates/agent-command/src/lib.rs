@@ -24,3 +24,7 @@ pub enum CommandError {
     #[error("unknown command type")]
     UnknownCommand,
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/network.rs"]
+mod test_network;

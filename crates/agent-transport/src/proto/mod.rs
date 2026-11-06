@@ -69,9 +69,10 @@ pub enum SignalType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Compression {
-    None = 0,
-    Zstd = 1,
-    Lz4 = 2,
+    Unspecified = 0,
+    None = 1,
+    Zstd = 2,
+    Lz4 = 3,
 }
 
 /// Minimal tonic gRPC client for IngestorService.
@@ -276,3 +277,15 @@ pub mod command_service_client {
 }
 
 pub use command_service_client::CommandServiceClient;
+
+#[cfg(test)]
+mod canonical_wire_tests {
+    use super::Compression;
+    #[test]
+    fn compression_values_match_canonical_proto() {
+        assert_eq!(Compression::Unspecified as i32, 0);
+        assert_eq!(Compression::None as i32, 1);
+        assert_eq!(Compression::Zstd as i32, 2);
+        assert_eq!(Compression::Lz4 as i32, 3);
+    }
+}

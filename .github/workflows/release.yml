@@ -26,26 +26,31 @@ jobs:
           - variant: linux
             arch: amd64
             target: x86_64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent
             pkg: tar
           - variant: linux
             arch: arm64
             target: aarch64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent
             pkg: tar
           - variant: lite
             arch: amd64
             target: x86_64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent-lite
             pkg: tar
           - variant: lite
             arch: arm64
             target: aarch64-unknown-linux-musl
+            source_binary: aegis-agent
             binary: aegis-agent-lite
             pkg: tar
           - variant: windows
             arch: amd64
             target: x86_64-pc-windows-gnu
+            source_binary: aegis-agent.exe
             binary: aegis-agent.exe
             pkg: zip
     steps:
@@ -73,19 +78,17 @@ jobs:
 
       - name: Build (native amd64)
         if: matrix.arch == 'amd64'
-        run: cargo build --release ${{ matrix.variant != 'linux' && '--no-default-features' || '' }} --features ${{ matrix.variant }} --target ${{ matrix.target }}
+        run: cargo build --release --locked --no-default-features --features ${{ matrix.variant }} --target ${{ matrix.target }}
 
       - name: Build (cross arm64)
         if: matrix.arch == 'arm64'
-        run: cross build --release ${{ matrix.variant != 'linux' && '--no-default-features' || '' }} --features ${{ matrix.variant }} --target ${{ matrix.target }}
+        run: cross build --release --locked --no-default-features --features ${{ matrix.variant }} --target ${{ matrix.target }}
 
       - name: Package binary (tar)
         if: matrix.pkg == 'tar'
         run: |
           mkdir -p dist
-          # Cargo builds a single binary (aegis-agent); variants are feature
-          # sets, so rename it to the variant's binary name here.
-          cp target/${{ matrix.target }}/release/aegis-agent dist/${{ matrix.binary }}
+          cp target/${{ matrix.target }}/release/${{ matrix.source_binary }} dist/${{ matrix.binary }}
           cd dist
           sha256sum ${{ matrix.binary }} > ${{ matrix.binary }}.sha256
           tar -czf aegis-agent-${{ matrix.variant }}-${{ matrix.arch }}.tar.gz ${{ matrix.binary }}
@@ -95,7 +98,7 @@ jobs:
         if: matrix.pkg == 'zip'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.binary }}
+          cp target/${{ matrix.target }}/release/${{ matrix.source_binary }} dist/${{ matrix.binary }}
           cd dist
           sha256sum ${{ matrix.binary }} > ${{ matrix.binary }}.sha256
           zip aegis-agent-${{ matrix.variant }}-${{ matrix.arch }}.zip ${{ matrix.binary }}
@@ -179,6 +182,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  verify-public-image:
+    name: Verify anonymous image pull
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - name: Pull the published version without credentials
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          export DOCKER_CONFIG="$(mktemp -d)"
+          docker pull "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${version}"
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
@@ -207,7 +221,11 @@ jobs:
           cat release/*.sha256 > release/checksums.sha256
 
       - name: Copy install script
-        run: cp scripts/install.sh release/install.sh
+        run: |
+          cp get.sh release/get.sh
+          cp scripts/install.sh release/install.sh
+          (cd release && sha256sum get.sh > get.sh.sha256 && sha256sum install.sh > install.sh.sha256)
+          cat release/get.sh.sha256 release/install.sh.sha256 >> release/checksums.sha256
 
       # Binaries go to the public releases repo: dodo_agent is private, so its
       # own release assets are not downloadable by customers. get.sh reads
@@ -232,7 +250,7 @@ jobs:
 
             **Linux:**
             ```bash
-            curl -fsSL https://dodo.oppervision.com.br/agent | sudo bash -s -- --mode server --api-key $DODO_API_KEY
+            curl -fsSL https://dodo.oppervision.com.br/agent | sudo DODO_API_KEY="$DODO_API_KEY" bash -s -- --mode server
             ```
 
             **Docker:**
