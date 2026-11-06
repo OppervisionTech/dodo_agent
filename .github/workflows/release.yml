@@ -269,3 +269,43 @@ jobs:
 
             ## What's Changed
             See the changelog at https://dodo.oppervision.com.br/pt/changelog/
+
+  # After the image is public, open the chart bump PR in dodo_helm_charts.
+  # Merging it publishes the chart (helm-publish runs on charts/aegis-agent/**).
+  # Needs CHARTS_PR_TOKEN: a fine-grained token with contents and
+  # pull-requests write on dodo_helm_charts. Without it the job only warns.
+  chart-bump:
+    name: Open chart bump PR
+    runs-on: ubuntu-latest
+    needs: [verify-public-image, release]
+    if: ${{ !contains(github.ref_name, '-') }} # skip pre-releases (v1.2.3-rc1)
+    env:
+      GH_TOKEN: ${{ secrets.CHARTS_PR_TOKEN }}
+      CHARTS_REPO: OppervisionTech/dodo_helm_charts
+    steps:
+      - name: Bump aegis-agent chart and open PR
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::CHARTS_PR_TOKEN not set; bump the aegis-agent chart by hand"
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          branch="chore/aegis-agent-${version}"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${CHARTS_REPO}.git" charts
+          cd charts
+          chart=charts/aegis-agent/Chart.yaml
+          if grep -q "^appVersion: \"${version}\"" "$chart"; then
+            echo "chart already at appVersion ${version}"
+            exit 0
+          fi
+          sed -i "s/^version: .*/version: ${version}/; s/^appVersion: .*/appVersion: \"${version}\"/" "$chart"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "chore(aegis-agent): chart ${version} (agent ${GITHUB_REF_NAME})"
+          git push --force origin "$branch"
+          gh pr view "$branch" -R "$CHARTS_REPO" >/dev/null 2>&1 || gh pr create -R "$CHARTS_REPO" \
+            --base main --head "$branch" \
+            --title "chore(aegis-agent): chart ${version}" \
+            --body "Automated: agent ${GITHUB_REF_NAME} image is published and verified. Bumps chart \`version\` and \`appVersion\` to ${version}. Merging publishes the chart."
