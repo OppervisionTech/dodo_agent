@@ -885,7 +885,7 @@ verify_k8s() {
     printf "    --from-file=ca.crt=ca.pem \\\\\n"
     printf "    --from-file=tls.crt=agent.pem \\\\\n"
     printf "    --from-file=tls.key=agent-key.pem\n"
-    printf "  helm upgrade aegis-agent aegisops/aegis-agent -n %s --set tls.secretName=aegis-tls\n" "${DODO_NAMESPACE}"
+    printf "  helm upgrade aegis-agent %s -n %s --reuse-values --set tls.secretName=aegis-tls\n" "${HELM_OCI_CHART}" "${DODO_NAMESPACE}"
   fi
   printf "\n"
 }
@@ -943,7 +943,7 @@ show_dev_guide() {
   printf "  docker rm -f aegis-agent-dev\n\n"
 
   printf "${BOLD}Restart with different settings:${RESET}\n"
-  printf "  DODO_API_KEY=my-key DODO_ENDPOINT=sandbox.aegisops.io:443 \\\\\n"
+  printf "  DODO_API_KEY=my-key DODO_ENDPOINT=%s \\\\\n" "${DEFAULT_GRPC_ENDPOINT}"
   printf "    bash get.sh --mode dev --non-interactive\n\n"
 }
 
@@ -951,7 +951,7 @@ dev() {
   step "Dev Mode — Local Docker (OTEL / SDK Testing)"
   check_deps_dev
 
-  local default_dev_endpoint="sandbox.aegisops.io:443"
+  local default_dev_endpoint="${DEFAULT_GRPC_ENDPOINT}"
   prompt_if_empty DODO_API_KEY  "API Key (or press Enter for 'dev-key')" "dev-key" "true"
   prompt_if_empty DODO_ENDPOINT "Remote endpoint"                        "${default_dev_endpoint}"
 
