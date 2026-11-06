@@ -1,4 +1,4 @@
-name: Agent CD (local)
+name: Agent CD
 
 on:
   push:
@@ -22,7 +22,7 @@ env:
 jobs:
   build-push:
     name: Build & Push Image
-    runs-on: [self-hosted, local]
+    runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment || 'staging' }}
     outputs:
       image-tag: ${{ steps.meta.outputs.version }}
@@ -89,7 +89,7 @@ jobs:
 
   coverage-staging:
     name: Coverage Report (Staging)
-    runs-on: [self-hosted, local]
+    runs-on: ubuntu-latest
     if: (github.event.inputs.environment || 'staging') == 'staging'
     steps:
       - uses: actions/checkout@v4
