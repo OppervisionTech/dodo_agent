@@ -147,7 +147,7 @@ if [[ ! -f "${CONFIG_DIR}/agent.yaml" ]]; then
         echo "WARNING: Default config not found, creating minimal config"
         cat > "${CONFIG_DIR}/agent.yaml" << 'YAML'
 endpoint:
-  address: "kong.aegisops.io:443"
+  address: "grpc.stg.dodo.oppervision.com.br:443"
 logging:
   level: "info"
 YAML

@@ -53,7 +53,7 @@ pub struct LocalAgentConfig {
 /// This default only matters for hand-written configs that omit the key
 /// entirely, and always points at production.
 fn default_enrollment_endpoint() -> String {
-    "https://kong.aegisops.io:443/v1/enroll".to_string()
+    "https://api.stg.dodo.oppervision.com.br/v1/enroll".to_string()
 }
 
 fn default_endpoint() -> EndpointLocalConfig {
@@ -98,7 +98,7 @@ pub struct EndpointLocalConfig {
 }
 
 fn default_address() -> String {
-    "kong.aegisops.io:443".to_string()
+    "grpc.stg.dodo.oppervision.com.br:443".to_string()
 }
 fn default_timeout_ms() -> u32 {
     5000

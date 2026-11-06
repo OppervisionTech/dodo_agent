@@ -149,9 +149,10 @@ detect_platform() {
 
 # ─── Enrollment Endpoint Derivation ───────────────────────────────────────────
 
-# Known production gRPC endpoint whose enrollment endpoint we can safely infer.
-readonly PROD_GRPC_ENDPOINT="kong.aegisops.io:443"
-readonly PROD_ENROLLMENT_ENDPOINT="https://kong.aegisops.io:443/v1/enroll"
+# Default (live) gRPC endpoint whose enrollment endpoint we can safely infer.
+# gRPC goes to grpc.*, enrollment (HTTPS) to api.* on the same Kong.
+readonly DEFAULT_GRPC_ENDPOINT="grpc.stg.dodo.oppervision.com.br:443"
+readonly DEFAULT_ENROLLMENT_ENDPOINT="https://api.stg.dodo.oppervision.com.br/v1/enroll"
 
 # Populates DODO_ENROLLMENT_ENDPOINT if not already set via --enrollment-endpoint.
 #
@@ -159,15 +160,15 @@ readonly PROD_ENROLLMENT_ENDPOINT="https://kong.aegisops.io:443/v1/enroll"
 # the general case: gRPC ingest and HTTPS enrollment are not guaranteed to share
 # a hostname per environment (e.g. staging uses grpc.staging.oppervision.com.br
 # for gRPC but api.staging.oppervision.com.br for enrollment, to keep ALPN
-# unambiguous between h2/grpcs and https on Kong). Only the known production
-# default is safe to infer automatically.
+# unambiguous between h2/grpcs and https on Kong). Only the known default
+# endpoint is safe to infer automatically.
 derive_enrollment_endpoint() {
   if [[ -n "${DODO_ENROLLMENT_ENDPOINT}" ]]; then
     return 0
   fi
 
-  if [[ "${DODO_ENDPOINT}" == "${PROD_GRPC_ENDPOINT}" ]]; then
-    DODO_ENROLLMENT_ENDPOINT="${PROD_ENROLLMENT_ENDPOINT}"
+  if [[ "${DODO_ENDPOINT}" == "${DEFAULT_GRPC_ENDPOINT}" ]]; then
+    DODO_ENROLLMENT_ENDPOINT="${DEFAULT_ENROLLMENT_ENDPOINT}"
     return 0
   fi
 

@@ -2,7 +2,7 @@
 # Override values via remote config pull (every 60s).
 
 endpoint:
-  address: "kong.aegisops.io:443"
+  address: "grpc.stg.dodo.oppervision.com.br:443"
   timeout_ms: 5000
   retry_max: 3
   retry_backoff_ms: 1000
