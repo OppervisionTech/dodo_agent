@@ -16,7 +16,7 @@ set -euo pipefail
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="0.3.0"
+readonly SCRIPT_VERSION="0.3.1"
 readonly GITHUB_REPO="OppervisionTech/dodo-agent-releases"
 readonly GITHUB_RELEASES_BASE="https://github.com/${GITHUB_REPO}/releases"
 readonly DOCKER_IMAGE="ghcr.io/oppervisiontech/aegis-agent"
