@@ -50,5 +50,11 @@ moved="$(DODO_API_KEY=dodo_bbbb _reset_identity_on_key_change "$fixture/agent.en
 [[ ! -e "$data/agent_id" && -d "$data/certs" && ! -e "$data/certs/agent.pem" ]] || fail 'fresh identity not prepared'
 [[ -z "$(DODO_API_KEY=dodo_bbbb _reset_identity_on_key_change "$fixture/missing.env" "$data")" ]] \
   || fail 'first install rotated the identity'
+[[ "$(stat -c %a "$moved")" == 700 ]] || fail 'backup dir not 0700'
+# A symlinked identity entry (planted by the service user) is refused.
+ln -s /etc "$data/agent_id"
+(DODO_API_KEY=dodo_cccc _reset_identity_on_key_change "$fixture/agent.env" "$data") >/dev/null 2>&1 \
+  && fail 'symlinked agent_id was moved'
+[[ -L "$data/agent_id" ]] || fail 'symlink was touched'
 
 echo INSTALLER_CONTRACT_OK

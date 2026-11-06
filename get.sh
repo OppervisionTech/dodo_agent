@@ -643,11 +643,17 @@ _reset_identity_on_key_change() {
     return 0
   fi
   [[ "${xtrace_was_on}" == "true" ]] && set -x
-  keep="${data_dir}/previous-identity-$(date +%Y%m%d%H%M%S)"
-  mkdir -p "${keep}"
-  chmod 700 "${keep}"
+  # data_dir is owned by the service user, so never trust a predictable
+  # path there: mktemp creates a fresh 0700 dir atomically (fails instead of
+  # following a planted symlink), and symlinked entries are refused.
+  keep="$(mktemp -d "${data_dir}/previous-identity-$(date +%Y%m%d%H%M%S)-XXXXXX")" \
+    || error "Could not create a backup directory in ${data_dir}"
+  [[ -d "${keep}" && ! -L "${keep}" ]] || error "Backup path ${keep} is not a plain directory"
   for p in agent_id certs buffer; do
-    if [[ -e "${data_dir}/${p}" ]]; then mv "${data_dir}/${p}" "${keep}/"; fi
+    if [[ -L "${data_dir}/${p}" ]]; then
+      error "${data_dir}/${p} is a symlink; refusing to move it (inspect the host)"
+    fi
+    if [[ -e "${data_dir}/${p}" ]]; then mv -T -- "${data_dir}/${p}" "${keep}/${p}"; fi
   done
   mkdir -p "${data_dir}/certs" "${data_dir}/buffer"
   printf '%s\n' "${keep}"
