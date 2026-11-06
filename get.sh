@@ -478,6 +478,12 @@ endpoint:
   retry_max: 3
   retry_backoff_ms: 1000
 
+# Inside the container the probe server must listen on all interfaces;
+# the host side is published on 127.0.0.1 only (docker run -p).
+health:
+  enabled: true
+  listen: "0.0.0.0:${HEALTH_PORT}"
+
 tls:
   enabled: false
   ca_cert_path: ""

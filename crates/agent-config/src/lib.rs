@@ -43,6 +43,36 @@ pub struct LocalAgentConfig {
     /// Set to empty string to disable enrollment (manual cert management).
     #[serde(default = "default_enrollment_endpoint")]
     pub enrollment_endpoint: String,
+    /// Liveness/readiness HTTP endpoint (/healthz, /readyz).
+    #[serde(default)]
+    pub health: HealthLocalConfig,
+}
+
+/// Health probe server. Loopback by default; the Helm chart sets
+/// `0.0.0.0:9090` so the kubelet can reach it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HealthLocalConfig {
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_health_listen")]
+    pub listen: String,
+}
+
+fn default_health_enabled() -> bool {
+    true
+}
+
+fn default_health_listen() -> String {
+    "127.0.0.1:9090".to_string()
+}
+
+impl Default for HealthLocalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_enabled(),
+            listen: default_health_listen(),
+        }
+    }
 }
 
 /// Last-resort fallback only — not environment-aware. `get.sh` and the
@@ -81,6 +111,7 @@ impl Default for LocalAgentConfig {
             config_pull_interval_seconds: 60,
             agent_id_path: default_agent_id_path(),
             enrollment_endpoint: default_enrollment_endpoint(),
+            health: HealthLocalConfig::default(),
         }
     }
 }
