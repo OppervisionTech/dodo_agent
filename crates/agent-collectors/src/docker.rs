@@ -20,7 +20,14 @@ use tracing::{debug, info};
 
 use crate::helpers;
 
+/// Upper bound for one Docker API response (container list/stats are small).
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(unix)]
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
+#[cfg(windows)]
+const DOCKER_SOCKET: &str = r"\\.\pipe\docker_engine";
 const COLLECT_INTERVAL_SECS: u64 = 10;
 
 // ---------------------------------------------------------------------------
@@ -121,11 +128,30 @@ struct PreviousContainerState {
 }
 
 // ---------------------------------------------------------------------------
-// Docker API client (raw HTTP over Unix socket)
+// Docker API client (raw HTTP over the Unix socket, or the named pipe on Windows)
 // ---------------------------------------------------------------------------
 
+/// Bidirectional byte stream to the Docker Engine API.
+trait DockerStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> DockerStream for T {}
+
+#[cfg(unix)]
+async fn connect_docker() -> std::io::Result<Box<dyn DockerStream>> {
+    let stream = tokio::net::UnixStream::connect(DOCKER_SOCKET).await?;
+    Ok(Box::new(stream))
+}
+
+/// The pipe is opened with tokio's default `SECURITY_IDENTIFICATION` QoS, so
+/// a process squatting the pipe name cannot impersonate the agent; its replies
+/// are still bounded by `MAX_RESPONSE_BYTES` and `READ_TIMEOUT` below.
+#[cfg(windows)]
+async fn connect_docker() -> std::io::Result<Box<dyn DockerStream>> {
+    let pipe = tokio::net::windows::named_pipe::ClientOptions::new().open(DOCKER_SOCKET)?;
+    Ok(Box::new(pipe))
+}
+
 async fn docker_get(path: &str) -> Result<Vec<u8>, CollectorError> {
-    let mut stream = tokio::net::UnixStream::connect(DOCKER_SOCKET)
+    let mut stream = connect_docker()
         .await
         .map_err(|e| CollectorError::Io(e.to_string()))?;
 
@@ -138,11 +164,18 @@ async fn docker_get(path: &str) -> Result<Vec<u8>, CollectorError> {
         .await
         .map_err(|e| CollectorError::Io(e.to_string()))?;
 
+    // Bounded read: a stuck or hostile endpoint cannot hang the collector or
+    // exhaust memory.
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .map_err(|e| CollectorError::Io(e.to_string()))?;
+    tokio::time::timeout(
+        READ_TIMEOUT,
+        (&mut stream)
+            .take(MAX_RESPONSE_BYTES)
+            .read_to_end(&mut response),
+    )
+    .await
+    .map_err(|_| CollectorError::Io("docker API read timed out".to_string()))?
+    .map_err(|e| CollectorError::Io(e.to_string()))?;
 
     // Find body after \r\n\r\n
     let response_str = String::from_utf8_lossy(&response);
@@ -197,7 +230,7 @@ fn decode_chunked(data: &[u8]) -> Vec<u8> {
 }
 
 async fn docker_available() -> bool {
-    tokio::net::UnixStream::connect(DOCKER_SOCKET).await.is_ok()
+    connect_docker().await.is_ok()
 }
 
 // ---------------------------------------------------------------------------
