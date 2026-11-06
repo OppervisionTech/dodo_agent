@@ -62,20 +62,51 @@ DODO_NAMESPACE="${DODO_NAMESPACE:-dodo}"
 DODO_TLS_SECRET="${DODO_TLS_SECRET:-}"
 DODO_NON_INTERACTIVE="${DODO_NON_INTERACTIVE:-false}"
 
+# Value of an option that takes an argument; a missing value is an error, not a
+# silent shift past the end of "$@" (which `set -u` would turn into a crash).
+# Runs in the current shell (not in $(...)): error() must exit the installer
+# even where set -e is suspended.
+_need_value() {
+  [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || error "Option $1 requires a value"
+}
+
+usage() {
+  cat <<'USAGE'
+DoDo AegisOps Agent installer
+
+  curl -fsSL https://dodo.oppervision.com.br/agent | sudo DODO_API_KEY="$DODO_API_KEY" bash -s -- --mode server
+  curl -fsSL https://dodo.oppervision.com.br/agent | DODO_API_KEY="$DODO_API_KEY" bash -s -- --mode k8s
+
+Options (each also settable as an env var, e.g. DODO_MODE):
+  --mode server|k8s|dev        install target
+  --api-key KEY                prefer the DODO_API_KEY env var (keeps it out of ps/history)
+  --endpoint host:port         gRPC ingestor endpoint
+  --enrollment-endpoint URL    HTTPS enrollment URL ending in /v1/enroll
+  --variant linux|lite         binary variant (server mode)
+  --version latest|vX.Y.Z      release to install
+  --namespace NAME             Kubernetes namespace (k8s mode)
+  --tls-secret NAME            pre-provisioned TLS secret (k8s mode, air-gapped)
+  --non-interactive            never prompt
+  -h, --help                   show this help
+USAGE
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --mode)                DODO_MODE="$2";                shift 2 ;;
-      --api-key)             DODO_API_KEY="$2";              shift 2 ;;
-      --endpoint)             DODO_ENDPOINT="$2";             shift 2 ;;
-      --enrollment-endpoint) DODO_ENROLLMENT_ENDPOINT="$2";  shift 2 ;;
-      --variant)              DODO_VARIANT="$2";              shift 2 ;;
-      --version)              DODO_VERSION="$2";              shift 2 ;;
-      --namespace)            DODO_NAMESPACE="$2";            shift 2 ;;
-      --tls-secret)           DODO_TLS_SECRET="$2";           shift 2 ;;
-      --non-interactive)      DODO_NON_INTERACTIVE=true;      shift ;;
-      --)                     shift; break ;;
-      -*) warn "Unknown option: $1"; shift ;;
+      --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}"; continue ;;
+      --mode)                _need_value "$@"; DODO_MODE="$2";                shift 2 ;;
+      --api-key)             _need_value "$@"; DODO_API_KEY="$2";              shift 2 ;;
+      --endpoint)            _need_value "$@"; DODO_ENDPOINT="$2";             shift 2 ;;
+      --enrollment-endpoint) _need_value "$@"; DODO_ENROLLMENT_ENDPOINT="$2";  shift 2 ;;
+      --variant)             _need_value "$@"; DODO_VARIANT="$2";              shift 2 ;;
+      --version)             _need_value "$@"; DODO_VERSION="$2";              shift 2 ;;
+      --namespace)           _need_value "$@"; DODO_NAMESPACE="$2";            shift 2 ;;
+      --tls-secret)          _need_value "$@"; DODO_TLS_SECRET="$2";           shift 2 ;;
+      --non-interactive)     DODO_NON_INTERACTIVE=true;                     shift ;;
+      -h|--help)             usage; exit 0 ;;
+      --)                    shift; break ;;
+      *) error "Unknown option: $1 (see the installer reference in the docs)" ;;
     esac
   done
 }
@@ -294,6 +325,16 @@ check_deps_dev() {
 
 # ─── Binary Download ──────────────────────────────────────────────────────────
 
+# Fail closed unless <archive> matches the first hash in <sumfile>. Only the
+# hash is read: the file name in the .sha256 is ignored.
+verify_checksum() {
+  local archive="$1" sumfile="$2" expected actual
+  expected="$(awk 'NR==1{print $1}' "${sumfile}")"
+  [[ "${expected}" =~ ^[0-9a-f]{64}$ ]] || error "Malformed checksum file: ${sumfile}"
+  actual="$(sha256sum "${archive}" | awk '{print $1}')"
+  [[ "${actual}" == "${expected}" ]] || error "Checksum mismatch for ${archive##*/}: refusing to install"
+}
+
 _download_binary() {
   local bin_name="aegis-agent"
   [[ "${DODO_VARIANT}" == "lite" ]] && bin_name="aegis-agent-lite"
@@ -324,7 +365,7 @@ _download_binary() {
 
   if curl -fsSL "${base_url}/${archive}.sha256" -o "${tmp}/check.sha256" 2>/dev/null; then
     info "Verifying checksum..."
-    (cd "${tmp}" && printf '%s  archive.tar.gz\n' "$(awk '{print $1}' check.sha256)" | sha256sum -c -)
+    verify_checksum "${tmp}/archive.tar.gz" "${tmp}/check.sha256"
     ok "Checksum verified"
   else
     error "Checksum file not available at ${base_url}/${archive}.sha256 — refusing to install an unverified binary"
@@ -1041,4 +1082,8 @@ main() {
   printf "${GREEN}${BOLD}Done.${RESET}\n\n"
 }
 
-main "$@"
+# Run only when executed (`bash get.sh`, `curl ... | bash`), not when sourced by
+# tests/test-installer.sh.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
