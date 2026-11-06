@@ -16,7 +16,7 @@ set -euo pipefail
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="0.1.0"
+readonly SCRIPT_VERSION="0.3.0"
 readonly GITHUB_REPO="OppervisionTech/dodo-agent-releases"
 readonly GITHUB_RELEASES_BASE="https://github.com/${GITHUB_REPO}/releases"
 readonly DOCKER_IMAGE="ghcr.io/oppervisiontech/aegis-agent"
@@ -313,7 +313,9 @@ _download_binary() {
 
   local tmp
   tmp="$(mktemp -d)"
-  trap 'rm -rf "${tmp}"' EXIT
+  # Expand now: the trap runs at script exit, after this local is gone (set -u).
+  # shellcheck disable=SC2064
+  trap "rm -rf '${tmp}'" EXIT
 
   info "Downloading ${archive} from GitHub Releases..."
   if ! curl -fSL "${base_url}/${archive}" -o "${tmp}/archive.tar.gz" 2>/dev/null; then
@@ -627,6 +629,7 @@ ProtectHome=yes
 ReadWritePaths=/var/lib/aegis /var/log/aegis
 ReadOnlyPaths=/etc/aegis
 PrivateTmp=yes
+UMask=0077
 NoNewPrivileges=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes

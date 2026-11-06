@@ -8,9 +8,9 @@ endpoint:
   retry_backoff_ms: 1000
 
 tls:
-  ca_cert_path: "/etc/aegis/certs/ca.pem"
-  client_cert_path: "/etc/aegis/certs/agent.pem"
-  client_key_path: "/etc/aegis/certs/agent-key.pem"
+  ca_cert_path: "/var/lib/aegis/certs/ca.pem"
+  client_cert_path: "/var/lib/aegis/certs/agent.pem"
+  client_key_path: "/var/lib/aegis/certs/agent-key.pem"
   verify_server: true
 
 buffer:
@@ -72,7 +72,7 @@ collectors:
       max_line_bytes: "16384"
 
   - name: otel
-    enabled: false
+    enabled: true
     interval_seconds: 1
 
   - name: kubernetes

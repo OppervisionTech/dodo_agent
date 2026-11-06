@@ -1,0 +1,3 @@
+# Existing organization runner label; this config grants no runner access.
+self-hosted-runner:
+  labels: ['local']

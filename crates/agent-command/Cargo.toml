@@ -17,3 +17,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+h2 = "0.4"
+http = "1"
+libc = "0.2"
+prost = { workspace = true }

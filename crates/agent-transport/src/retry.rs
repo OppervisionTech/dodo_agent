@@ -2,15 +2,20 @@ use crate::{SubmitResult, TransportError, TransportResult};
 use tracing::{debug, warn};
 
 /// gRPC status codes that are retryable.
-fn is_retryable_code(code: &str) -> bool {
-    matches!(code, "UNAVAILABLE" | "DEADLINE_EXCEEDED")
+fn is_retryable_code(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    )
 }
 
 /// gRPC status codes that must NOT be retried.
-fn is_non_retryable_code(code: &str) -> bool {
+fn is_non_retryable_code(code: tonic::Code) -> bool {
     matches!(
         code,
-        "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "RESOURCE_EXHAUSTED"
+        tonic::Code::InvalidArgument
+            | tonic::Code::Unauthenticated
+            | tonic::Code::ResourceExhausted
     )
 }
 
@@ -55,10 +60,7 @@ where
                 }
                 return Ok(result);
             }
-            Err(TransportError::Grpc {
-                ref code,
-                ref message,
-            }) => {
+            Err(TransportError::Grpc { code, ref message }) => {
                 if is_non_retryable_code(code) {
                     return Err(TransportError::NotRetryable(format!(
                         "{operation_name}: {code} - {message}"
@@ -71,7 +73,7 @@ where
                 let backoff_ms = config.base_backoff_ms * 2u32.pow(attempt);
                 warn!(
                     operation = operation_name,
-                    code = code,
+                    code = ?code,
                     attempt = attempt + 1,
                     max = config.max_retries,
                     backoff_ms = backoff_ms,
@@ -96,6 +98,7 @@ where
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms as u64)).await;
                 attempt += 1;
             }
+            Err(e @ TransportError::NotRetryable(_)) => return Err(e),
             Err(e) => {
                 if attempt >= config.max_retries {
                     last_error = e.to_string();
@@ -120,4 +123,67 @@ where
         attempts: attempt + 1,
         last_error,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_policy_distinguishes_transient_permanent_and_bounded_failures() {
+        let defaults = RetryConfig::default();
+        assert_eq!((defaults.max_retries, defaults.base_backoff_ms), (3, 1000));
+        for (code, expected_calls) in [
+            (tonic::Code::InvalidArgument, 1),
+            (tonic::Code::Unauthenticated, 1),
+            (tonic::Code::ResourceExhausted, 1),
+            (tonic::Code::PermissionDenied, 1),
+            (tonic::Code::Unavailable, 3),
+            (tonic::Code::DeadlineExceeded, 3),
+        ] {
+            let calls = AtomicUsize::new(0);
+            let result = with_retry(
+                &RetryConfig {
+                    max_retries: 2,
+                    base_backoff_ms: 1,
+                },
+                "contract",
+                || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    std::future::ready(Err(TransportError::Grpc {
+                        code,
+                        message: "synthetic".into(),
+                    }))
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
+        }
+        for timeout in [false, true] {
+            let calls = AtomicUsize::new(0);
+            let result = with_retry(
+                &RetryConfig {
+                    max_retries: 1,
+                    base_backoff_ms: 1,
+                },
+                "contract",
+                || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    std::future::ready(Err(if timeout {
+                        TransportError::Timeout(10)
+                    } else {
+                        TransportError::Connection("offline".into())
+                    }))
+                },
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(TransportError::RetryExhausted { attempts: 2, .. })
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+        }
+    }
 }
