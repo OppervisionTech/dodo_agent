@@ -18,9 +18,6 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.variant }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
-    # The windows target does not compile yet (unix-only code in
-    # agent-collectors); keep it from blocking the Linux release.
-    continue-on-error: ${{ matrix.variant == 'windows' }}
     strategy:
       # One broken variant must not cancel the others.
       fail-fast: false
@@ -229,6 +226,7 @@ jobs:
             | Linux    | arm64 | Standard | `aegis-agent-linux-arm64.tar.gz` |
             | Linux    | amd64 | Lite (IoT/Edge) | `aegis-agent-lite-amd64.tar.gz` |
             | Linux    | arm64 | Lite (IoT/Edge) | `aegis-agent-lite-arm64.tar.gz` |
+            | Windows  | amd64 | Standard | `aegis-agent-windows-amd64.zip` |
 
             ## Quick Install
 

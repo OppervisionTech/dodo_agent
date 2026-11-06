@@ -3,10 +3,57 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+mod health;
+
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What the command line asks for. The agent takes no options besides these;
+/// everything else comes from the config file (AEGIS_CONFIG).
+#[derive(Debug, PartialEq)]
+enum CliAction {
+    Run,
+    Version,
+    Help,
+    Unknown(String),
+}
+
+fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> CliAction {
+    match args.into_iter().nth(1).as_deref() {
+        None => CliAction::Run,
+        Some("--version" | "-V") => CliAction::Version,
+        Some("--help" | "-h") => CliAction::Help,
+        Some(other) => CliAction::Unknown(other.to_string()),
+    }
+}
+
+fn usage() -> String {
+    format!(
+        "aegis-agent {AGENT_VERSION} ({variant})\n\n\
+         Usage: aegis-agent [--version | --help]\n\n\
+         Configuration is read from $AEGIS_CONFIG (default /etc/aegis/agent.yaml).\n\
+         The API key for certificate enrollment is read from $DODO_API_KEY.\n",
+        variant = agent_variant()
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    match parse_cli(std::env::args()) {
+        CliAction::Run => {}
+        CliAction::Version => {
+            println!("aegis-agent {AGENT_VERSION} ({})", agent_variant());
+            return Ok(());
+        }
+        CliAction::Help => {
+            print!("{}", usage());
+            return Ok(());
+        }
+        CliAction::Unknown(arg) => {
+            eprintln!("aegis-agent: unknown argument '{arg}'\n\n{}", usage());
+            std::process::exit(2);
+        }
+    }
+
     // Determine variant at compile time
     let variant = agent_variant();
 
@@ -80,6 +127,16 @@ async fn main() -> Result<()> {
 
     // Create cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
+
+    // Health probes: /healthz from now on, /readyz once startup completes.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if config.health.enabled {
+        tokio::spawn(health::serve(
+            config.health.listen.clone(),
+            ready.clone(),
+            cancel_token.clone(),
+        ));
+    }
 
     // Build collector registry
     let platform_arc: Arc<dyn agent_platform::Platform> = Arc::from(platform);
@@ -183,6 +240,9 @@ async fn main() -> Result<()> {
         )
         .await;
     }
+
+    // Enrollment attempted and pipeline about to start: report ready.
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Spawn batch consumer (transport layer)
     let transport_config = agent_transport::TransportConfig {
@@ -728,5 +788,38 @@ async fn run_transport(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_args_runs_the_agent() {
+        assert_eq!(parse_cli(args(&["aegis-agent"])), CliAction::Run);
+    }
+
+    #[test]
+    fn version_and_help_flags() {
+        assert_eq!(
+            parse_cli(args(&["aegis-agent", "--version"])),
+            CliAction::Version
+        );
+        assert_eq!(parse_cli(args(&["aegis-agent", "-V"])), CliAction::Version);
+        assert_eq!(parse_cli(args(&["aegis-agent", "--help"])), CliAction::Help);
+        assert_eq!(parse_cli(args(&["aegis-agent", "-h"])), CliAction::Help);
+    }
+
+    #[test]
+    fn unknown_argument_is_rejected() {
+        assert_eq!(
+            parse_cli(args(&["aegis-agent", "--mode"])),
+            CliAction::Unknown("--mode".to_string())
+        );
     }
 }
