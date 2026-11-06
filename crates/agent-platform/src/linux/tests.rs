@@ -1,20 +1,33 @@
 use super::*;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
+// Fixtures write fake executables and run them. With tests in parallel, a
+// fork from one test can inherit another test's still-open write fd, and the
+// exec then fails with ETXTBSY (the platform swallows it, so the test sees an
+// empty result). Serialize fixture tests instead of retrying around it.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fixture {
     root: PathBuf,
     platform: LinuxPlatform,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     fn new() -> Self {
+        // A failed test poisons the lock; the next test still runs.
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("dodo-proc-fixture-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("bin")).unwrap();
         let platform = LinuxPlatform {
             root: root.clone(),
             command_dir: Some(root.join("bin")),
         };
-        Self { root, platform }
+        Self {
+            root,
+            platform,
+            _serial: serial,
+        }
     }
 
     fn write(&self, path: &str, content: &str) {

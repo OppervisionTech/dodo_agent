@@ -38,4 +38,23 @@ printf corrupt >> "$fixture/download.tar.gz"
 printf 'not-a-hash  x\n' > "$fixture/bad.sha256"
 (verify_checksum "$fixture/download.tar.gz" "$fixture/bad.sha256") >/dev/null 2>&1 && fail 'malformed checksum accepted'
 
+# Re-install with a different API key moves the old identity aside.
+data="$fixture/data"; mkdir -p "$data/certs" "$data/buffer"
+echo old-id > "$data/agent_id"; echo cert > "$data/certs/agent.pem"
+printf 'DODO_API_KEY=dodo_aaaa\n' > "$fixture/agent.env"
+[[ -z "$(DODO_API_KEY=dodo_aaaa _reset_identity_on_key_change "$fixture/agent.env" "$data")" ]] \
+  || fail 'same key rotated the identity'
+[[ -f "$data/agent_id" ]] || fail 'same key removed agent_id'
+moved="$(DODO_API_KEY=dodo_bbbb _reset_identity_on_key_change "$fixture/agent.env" "$data")"
+[[ -n "$moved" && -f "$moved/agent_id" && -f "$moved/certs/agent.pem" ]] || fail 'old identity not moved aside'
+[[ ! -e "$data/agent_id" && -d "$data/certs" && ! -e "$data/certs/agent.pem" ]] || fail 'fresh identity not prepared'
+[[ -z "$(DODO_API_KEY=dodo_bbbb _reset_identity_on_key_change "$fixture/missing.env" "$data")" ]] \
+  || fail 'first install rotated the identity'
+[[ "$(stat -c %a "$moved")" == 700 ]] || fail 'backup dir not 0700'
+# A symlinked identity entry (planted by the service user) is refused.
+ln -s /etc "$data/agent_id"
+(DODO_API_KEY=dodo_cccc _reset_identity_on_key_change "$fixture/agent.env" "$data") >/dev/null 2>&1 \
+  && fail 'symlinked agent_id was moved'
+[[ -L "$data/agent_id" ]] || fail 'symlink was touched'
+
 echo INSTALLER_CONTRACT_OK

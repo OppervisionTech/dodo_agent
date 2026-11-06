@@ -16,7 +16,7 @@ set -euo pipefail
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="0.3.1"
+readonly SCRIPT_VERSION="0.3.2"
 readonly GITHUB_REPO="OppervisionTech/dodo-agent-releases"
 readonly GITHUB_RELEASES_BASE="https://github.com/${GITHUB_REPO}/releases"
 readonly DOCKER_IMAGE="ghcr.io/oppervisiontech/aegis-agent"
@@ -627,6 +627,38 @@ YAML
   ok "Dev config written: ${config_file}"
 }
 
+# The ingestor binds an agent_id (and its mTLS key) to the API key it enrolled
+# with and refuses to move it to another key. Re-running the installer with a
+# different key therefore needs a fresh identity: move agent_id, certs and the
+# buffer (records stamped with the old agent_id) aside, never delete them.
+# Args: env file, data dir. Prints the backup dir when it rotated.
+_reset_identity_on_key_change() {
+  local env_file="$1" data_dir="$2" old="" keep p
+  local xtrace_was_on=false
+  [[ $- == *x* ]] && xtrace_was_on=true
+  set +x
+  [[ -f "${env_file}" ]] && old="$(sed -n 's/^DODO_API_KEY=//p' "${env_file}" | head -n1)"
+  if [[ -z "${old}" || "${old}" == "${DODO_API_KEY}" ]]; then
+    [[ "${xtrace_was_on}" == "true" ]] && set -x
+    return 0
+  fi
+  [[ "${xtrace_was_on}" == "true" ]] && set -x
+  # data_dir is owned by the service user, so never trust a predictable
+  # path there: mktemp creates a fresh 0700 dir atomically (fails instead of
+  # following a planted symlink), and symlinked entries are refused.
+  keep="$(mktemp -d "${data_dir}/previous-identity-$(date +%Y%m%d%H%M%S)-XXXXXX")" \
+    || error "Could not create a backup directory in ${data_dir}"
+  [[ -d "${keep}" && ! -L "${keep}" ]] || error "Backup path ${keep} is not a plain directory"
+  for p in agent_id certs buffer; do
+    if [[ -L "${data_dir}/${p}" ]]; then
+      error "${data_dir}/${p} is a symlink; refusing to move it (inspect the host)"
+    fi
+    if [[ -e "${data_dir}/${p}" ]]; then mv -T -- "${data_dir}/${p}" "${keep}/${p}"; fi
+  done
+  mkdir -p "${data_dir}/certs" "${data_dir}/buffer"
+  printf '%s\n' "${keep}"
+}
+
 _write_agent_env() {
   local xtrace_was_on=false
   [[ $- == *x* ]] && xtrace_was_on=true
@@ -730,6 +762,15 @@ server() {
 
   step "Writing configuration"
   _write_server_config
+  if [[ -f "${CONFIG_DIR}/agent.env" ]]; then
+    local previous
+    command -v systemctl >/dev/null 2>&1 && systemctl stop aegis-agent 2>/dev/null || true
+    previous="$(_reset_identity_on_key_change "${CONFIG_DIR}/agent.env" "${DATA_DIR}")"
+    if [[ -n "${previous}" ]]; then
+      warn "API key changed: the old agent identity is bound to the old key."
+      warn "Starting a fresh identity; previous agent_id, certs and buffer moved to ${previous}"
+    fi
+  fi
   _write_agent_env
 
   step "Setting permissions"
@@ -762,7 +803,9 @@ verify_server() {
 
   local service_started=false
   if command -v systemctl >/dev/null 2>&1; then
-    if systemctl start aegis-agent 2>/dev/null; then
+    # restart, not start: on a re-install the service is already running the
+    # previous binary and key, and `start` would leave it untouched.
+    if systemctl restart aegis-agent 2>/dev/null; then
       service_started=true
     else
       warn "Service failed to start — check: systemctl status aegis-agent"
