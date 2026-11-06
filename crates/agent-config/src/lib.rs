@@ -132,7 +132,7 @@ fn default_address() -> String {
     "grpc.stg.dodo.oppervision.com.br:443".to_string()
 }
 fn default_timeout_ms() -> u32 {
-    5000
+    15000
 }
 fn default_retry_max() -> u32 {
     3
@@ -214,7 +214,7 @@ fn default_flush_interval_ms() -> u32 {
     5000
 }
 fn default_max_batch_size() -> u32 {
-    500
+    200
 }
 
 impl Default for BufferLocalConfig {

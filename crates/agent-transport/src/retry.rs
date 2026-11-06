@@ -1,12 +1,17 @@
 use crate::{SubmitResult, TransportError, TransportResult};
 use tracing::{debug, warn};
 
-/// gRPC status codes that are retryable.
-fn is_retryable_code(code: tonic::Code) -> bool {
-    matches!(
-        code,
-        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
-    )
+/// gRPC statuses that are retryable.
+///
+/// tonic reports its own client-side request timeout as `Cancelled` with the
+/// message "Timeout expired", not as `DeadlineExceeded`. Treat that as the
+/// deadline it is; any other `Cancelled` (e.g. shutdown) is not retried.
+fn is_retryable(code: tonic::Code, message: &str) -> bool {
+    match code {
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => true,
+        tonic::Code::Cancelled => message.contains("Timeout expired"),
+        _ => false,
+    }
 }
 
 /// gRPC status codes that must NOT be retried.
@@ -66,7 +71,7 @@ where
                         "{operation_name}: {code} - {message}"
                     )));
                 }
-                if !is_retryable_code(code) || attempt >= config.max_retries {
+                if !is_retryable(code, message) || attempt >= config.max_retries {
                     last_error = format!("{code} - {message}");
                     break;
                 }
@@ -141,6 +146,7 @@ mod tests {
             (tonic::Code::PermissionDenied, 1),
             (tonic::Code::Unavailable, 3),
             (tonic::Code::DeadlineExceeded, 3),
+            (tonic::Code::Cancelled, 1),
         ] {
             let calls = AtomicUsize::new(0);
             let result = with_retry(
@@ -161,6 +167,28 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
         }
+        // tonic's client timeout surfaces as Cancelled("Timeout expired").
+        let calls = AtomicUsize::new(0);
+        let result = with_retry(
+            &RetryConfig {
+                max_retries: 2,
+                base_backoff_ms: 1,
+            },
+            "contract",
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err(TransportError::Grpc {
+                    code: tonic::Code::Cancelled,
+                    message: "Timeout expired".into(),
+                }))
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(TransportError::RetryExhausted { attempts: 3, .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
         for timeout in [false, true] {
             let calls = AtomicUsize::new(0);
             let result = with_retry(

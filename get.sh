@@ -391,7 +391,7 @@ _write_server_config() {
 
 endpoint:
   address: "${DODO_ENDPOINT}"
-  timeout_ms: 5000
+  timeout_ms: 15000
   retry_max: 3
   retry_backoff_ms: 1000
 
@@ -411,7 +411,7 @@ buffer:
   path: "${BUFFER_DIR}"
   max_size_bytes: 536870912
   flush_interval_ms: 5000
-  max_batch_size: 500
+  max_batch_size: 200
 
 logging:
   level: "info"
@@ -515,7 +515,7 @@ _write_dev_config() {
 
 endpoint:
   address: "${DODO_ENDPOINT}"
-  timeout_ms: 5000
+  timeout_ms: 15000
   retry_max: 3
   retry_backoff_ms: 1000
 

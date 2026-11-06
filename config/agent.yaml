@@ -3,7 +3,7 @@
 
 endpoint:
   address: "grpc.stg.dodo.oppervision.com.br:443"
-  timeout_ms: 5000
+  timeout_ms: 15000
   retry_max: 3
   retry_backoff_ms: 1000
 
@@ -17,7 +17,7 @@ buffer:
   path: "/var/lib/aegis/buffer"
   max_size_bytes: 536870912  # 512 MB
   flush_interval_ms: 5000
-  max_batch_size: 500
+  max_batch_size: 200
 
 logging:
   level: "info"
