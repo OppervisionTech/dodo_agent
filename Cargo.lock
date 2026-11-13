@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "aegis-agent"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agent-collectors",
  "agent-command",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "agent-collectors"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agent-core",
  "agent-ebpf",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "agent-command"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agent-transport",
  "anyhow",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "agent-config"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agent-platform",
  "anyhow",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ebpf"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agent-core",
  "anyhow",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "agent-platform"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "libc",
  "serde",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "agent-transport"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "agent-core",
  "anyhow",
