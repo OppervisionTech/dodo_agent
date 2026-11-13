@@ -30,6 +30,39 @@ fn split_service(entry: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// Kubernetes metadata parsed from a kubelet pod log path.
+///
+/// Kubelet writes container logs to
+/// `/var/log/pods/<namespace>_<pod>_<uid>/<container>/<restart>.log`; the
+/// agent may see that tree under a host prefix such as `/host`.
+#[derive(Debug, PartialEq, Eq)]
+struct PodLogMeta<'a> {
+    namespace: &'a str,
+    pod: &'a str,
+    container: &'a str,
+}
+
+fn pod_log_meta(path: &str) -> Option<PodLogMeta<'_>> {
+    let (_, rest) = path.split_once("/var/log/pods/")?;
+    let mut parts = rest.split('/');
+    let dir = parts.next()?;
+    let container = parts.next()?;
+    let file = parts.next()?;
+    if container.is_empty() || !file.ends_with(".log") || parts.next().is_some() {
+        return None;
+    }
+    let (namespace, rest) = dir.split_once('_')?;
+    let (pod, uid) = rest.rsplit_once('_')?;
+    if namespace.is_empty() || pod.is_empty() || uid.is_empty() {
+        return None;
+    }
+    Some(PodLogMeta {
+        namespace,
+        pod,
+        container,
+    })
+}
+
 /// Expand a list of paths (which may include glob patterns) to concrete
 /// `(file path, source)` pairs.
 /// Glob patterns use the standard `*`, `?`, `[abc]` syntax.
@@ -38,7 +71,14 @@ fn expand_paths(entries: &[String]) -> Vec<(String, String)> {
     let mut result = Vec::new();
     for entry in entries {
         let (service, path) = split_service(entry);
-        let source = |file: &str| service.unwrap_or(file).to_string();
+        // Without an explicit `service=` prefix, kubelet pod logs use the
+        // container name as source instead of the file path.
+        let source = |file: &str| {
+            service
+                .map(str::to_string)
+                .or_else(|| pod_log_meta(file).map(|m| m.container.to_string()))
+                .unwrap_or_else(|| file.to_string())
+        };
         if path.contains('*') || path.contains('?') || path.contains('[') {
             match glob::glob(path) {
                 Ok(entries) => {
@@ -265,6 +305,7 @@ impl Collector for LogsCollector {
             let resolved_paths = expand_paths(&self.log_path_patterns);
 
             for (path, source) in &resolved_paths {
+                let pod_meta = pod_log_meta(path);
                 // Read the full file content via platform abstraction.
                 // In production this would use seek + read from offset.
                 // For MVP, we read the full file and track offset.
@@ -326,11 +367,17 @@ impl Collector for LogsCollector {
                         LogFormat::Plaintext => "plaintext",
                     };
 
+                    let mut attrs = vec![("format", format_label)];
+                    if let Some(m) = &pod_meta {
+                        attrs.push(("namespace", m.namespace));
+                        attrs.push(("pod", m.pod));
+                        attrs.push(("container", m.container));
+                    }
                     envelopes.push(log_envelope(
                         line,
                         severity,
                         source,
-                        &[("format", format_label)],
+                        &attrs,
                         trace_id.as_deref(),
                         span_id.as_deref(),
                     ));
@@ -426,6 +473,34 @@ mod tests {
 
         let envelopes = collector.collect().await.unwrap();
         assert!(envelopes.is_empty());
+    }
+
+    #[test]
+    fn pod_log_meta_parses_kubelet_path() {
+        assert_eq!(
+            pod_log_meta("/host/var/log/pods/staging_api-7d9f-x2k_0a1b-c2d3/api/0.log"),
+            Some(PodLogMeta {
+                namespace: "staging",
+                pod: "api-7d9f-x2k",
+                container: "api",
+            })
+        );
+        assert_eq!(pod_log_meta("/var/log/syslog"), None);
+        assert_eq!(pod_log_meta("/var/log/pods/bad/api/0.log"), None);
+        assert_eq!(pod_log_meta("/var/log/pods/ns_pod_uid/api/0.log.gz"), None);
+    }
+
+    #[test]
+    fn expand_paths_uses_container_for_pod_logs() {
+        let dir = std::env::temp_dir().join(format!("aegis-podlogs-{}", std::process::id()));
+        let file = dir.join("var/log/pods/kong_gw-1_abc/proxy/0.log");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "x\n").unwrap();
+        let pattern = format!("{}/var/log/pods/*/*/*.log", dir.display());
+        let got = expand_paths(&[pattern.clone(), format!("svc={pattern}")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got[0].1, "proxy");
+        assert_eq!(got[1].1, "svc");
     }
 
     #[test]
