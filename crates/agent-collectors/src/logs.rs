@@ -503,6 +503,28 @@ mod tests {
         assert_eq!(got[1].1, "svc");
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pod_log_lines_carry_k8s_fields() {
+        use prost::Message;
+        let dir = std::env::temp_dir().join(format!("aegis-podrun-{}", std::process::id()));
+        let file = dir.join("var/log/pods/staging_api-1_uid9/api/0.log");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "ERROR boom\n").unwrap();
+        let platform = Arc::new(agent_platform::linux::LinuxPlatform::new()) as Arc<dyn Platform>;
+        let collector = LogsCollector::new(platform, vec![file.display().to_string()], None);
+        let envelopes = collector.collect().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(envelopes.len(), 1);
+        let log = crate::helpers::LogPayload::decode(envelopes[0].payload.as_slice()).unwrap();
+        assert_eq!(
+            log.fields.get("namespace").map(String::as_str),
+            Some("staging")
+        );
+        assert_eq!(log.fields.get("pod").map(String::as_str), Some("api-1"));
+        assert_eq!(log.fields.get("container").map(String::as_str), Some("api"));
+    }
+
     #[test]
     fn service_prefix_sets_source() {
         assert_eq!(
