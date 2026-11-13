@@ -198,9 +198,14 @@ impl Default for LinuxPlatform {
 
 impl Platform for LinuxPlatform {
     fn info(&self) -> PlatformResult<PlatformInfo> {
-        let hostname = fs::read_to_string(self.path("/proc/sys/kernel/hostname"))
-            .map(|s| s.trim().to_string())
-            .map_err(PlatformError::Io)?;
+        // In a Kubernetes DaemonSet the kernel hostname is the pod name; the
+        // downward API exposes the node as NODE_NAME, which is the real host.
+        let hostname = match std::env::var("NODE_NAME") {
+            Ok(node) if !node.trim().is_empty() => node.trim().to_string(),
+            _ => fs::read_to_string(self.path("/proc/sys/kernel/hostname"))
+                .map(|s| s.trim().to_string())
+                .map_err(PlatformError::Io)?,
+        };
 
         let kernel_version = fs::read_to_string(self.path("/proc/sys/kernel/osrelease"))
             .map(|s| s.trim().to_string())
