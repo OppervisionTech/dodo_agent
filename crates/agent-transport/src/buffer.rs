@@ -16,6 +16,9 @@ fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Priority directories for buffer organization.
+/// Upper bound for one buffer file.
+const MAX_FILE_BYTES: usize = 1024 * 1024;
+
 const PRIORITY_DIRS: &[(&str, &[SignalType])] = &[
     ("p0_security", &[SignalType::SecurityEvent]),
     ("p1_heartbeat", &[SignalType::Heartbeat]),
@@ -107,7 +110,7 @@ impl DiskBuffer {
             }
         }
         let mut written = 0;
-        for (dir_name, _) in PRIORITY_DIRS {
+        for (priority, (dir_name, _)) in PRIORITY_DIRS.iter().enumerate() {
             let group: Vec<&Envelope> = envelopes
                 .iter()
                 .filter(|envelope| self.priority_dir(envelope.signal_type).ends_with(dir_name))
@@ -115,53 +118,28 @@ impl DiskBuffer {
             if group.is_empty() {
                 continue;
             }
-            let mut data = Vec::new();
+            // Files of at most ~1 MB: eviction removes whole files, so one huge
+            // file would throw away far more than needed.
+            let mut chunks: Vec<(i64, Vec<u8>, usize)> = Vec::new();
             for envelope in &group {
+                let record = envelope.payload.len() + 16;
+                if chunks
+                    .last()
+                    .map_or(true, |(_, data, _)| data.len() + record > MAX_FILE_BYTES)
+                {
+                    chunks.push((envelope.timestamp_unix_ns, Vec::with_capacity(record), 0));
+                }
+                let (_, data, count) = chunks.last_mut().expect("chunk just pushed");
                 data.extend_from_slice(&(envelope.payload.len() as u32).to_le_bytes());
                 data.extend_from_slice(&envelope.payload);
                 data.extend_from_slice(&(envelope.signal_type as i32).to_le_bytes());
                 data.extend_from_slice(&envelope.timestamp_unix_ns.to_le_bytes());
+                *count += 1;
             }
-            let size = data.len() as u64;
-            if size > self.max_size_bytes {
-                return Err(TransportError::Buffer("batch exceeds buffer size".into()));
+            for (first_timestamp, data, count) in chunks {
+                self.write_file(priority, dir_name, first_timestamp, &data)?;
+                written += count;
             }
-            while self.used_bytes().saturating_add(size) > self.max_size_bytes {
-                self.evict_lowest_priority()?;
-            }
-            let dir = self.base_path.join(dir_name);
-            let path = dir.join(format!(
-                "{}_{}.buf",
-                group[0].timestamp_unix_ns,
-                uuid::Uuid::new_v4()
-            ));
-            let temporary = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-
-            let mut options = std::fs::OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let file = options
-                .open(&temporary)
-                .map_err(|e| TransportError::Buffer(format!("cannot create buffer record: {e}")))?;
-            let mut writer = BufWriter::new(file);
-            writer
-                .write_all(&data)
-                .map_err(|e| TransportError::Buffer(format!("write error: {e}")))?;
-            let file = writer
-                .into_inner()
-                .map_err(|e| TransportError::Buffer(format!("flush error: {e}")))?;
-            // fsync for crash safety
-            file.sync_all()
-                .map_err(|e| TransportError::Buffer(format!("fsync error: {e}")))?;
-            std::fs::rename(&temporary, &path)?;
-            // Persist the directory entry as well as the record contents.
-            sync_directory(&dir)?;
-            self.used.fetch_add(size, Ordering::Relaxed);
-            written += group.len();
         }
 
         if written > 0 {
@@ -173,6 +151,53 @@ impl DiskBuffer {
         }
 
         Ok(written)
+    }
+
+    fn write_file(
+        &self,
+        priority: usize,
+        dir_name: &str,
+        first_timestamp: i64,
+        data: &[u8],
+    ) -> TransportResult<()> {
+        let size = data.len() as u64;
+        if size > self.max_size_bytes {
+            return Err(TransportError::Buffer("batch exceeds buffer size".into()));
+        }
+        if self.used_bytes().saturating_add(size) > self.max_size_bytes {
+            // Never delete data more important than what is being written:
+            // when only higher priorities remain, the new data is dropped.
+            self.evict_lowest_priority(priority, size)?;
+        }
+        let dir = self.base_path.join(dir_name);
+        let path = dir.join(format!("{}_{}.buf", first_timestamp, uuid::Uuid::new_v4()));
+        let temporary = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&temporary)
+            .map_err(|e| TransportError::Buffer(format!("cannot create buffer record: {e}")))?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(data)
+            .map_err(|e| TransportError::Buffer(format!("write error: {e}")))?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| TransportError::Buffer(format!("flush error: {e}")))?;
+        // fsync for crash safety
+        file.sync_all()
+            .map_err(|e| TransportError::Buffer(format!("fsync error: {e}")))?;
+        std::fs::rename(&temporary, &path)?;
+        // Persist the directory entry as well as the record contents.
+        sync_directory(&dir)?;
+        self.used.fetch_add(size, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Read buffered records without deleting them. Legacy files may contain
@@ -326,9 +351,13 @@ impl DiskBuffer {
         self.base_path.join("p4_other")
     }
 
-    fn evict_lowest_priority(&self) -> TransportResult<()> {
-        // Evict from lowest priority first (p4, p3, p2...)
-        for (dir_name, _) in PRIORITY_DIRS.iter().rev() {
+    /// Free room for `needed` bytes, evicting oldest files from the lowest
+    /// priority up to, and including, `floor` (index in PRIORITY_DIRS); higher
+    /// priorities are never touched. Fails when that is not enough.
+    fn evict_lowest_priority(&self, floor: usize, needed: u64) -> TransportResult<()> {
+        let fits =
+            |buffer: &Self| buffer.used_bytes().saturating_add(needed) <= buffer.max_size_bytes;
+        for (dir_name, _) in PRIORITY_DIRS.iter().skip(floor).rev() {
             let dir = self.base_path.join(dir_name);
             if !dir.exists() {
                 continue;
@@ -336,25 +365,25 @@ impl DiskBuffer {
             let mut entries: Vec<_> = std::fs::read_dir(&dir)
                 .map_err(|e| TransportError::Buffer(format!("cannot read dir: {e}")))?
                 .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "buf"))
                 .collect();
 
-            // Sort oldest first
+            // Oldest first; remove ~10% per round until the new data fits.
             entries.sort_by_key(|e| e.file_name());
-
-            // Remove oldest 10% or at least 1 file
-            let to_remove = std::cmp::max(1, entries.len() / 10);
-            for entry in entries.into_iter().take(to_remove) {
-                let path = entry.path();
-                if let Err(e) = std::fs::remove_file(&path) {
-                    warn!(path = %path.display(), error = %e, "failed to evict buffer file");
-                } else {
-                    debug!(path = %path.display(), "evicted old buffer file");
+            let step = std::cmp::max(1, entries.len() / 10);
+            for round in entries.chunks(step) {
+                for entry in round {
+                    let path = entry.path();
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        warn!(path = %path.display(), error = %e, "failed to evict buffer file");
+                    } else {
+                        debug!(path = %path.display(), "evicted old buffer file");
+                    }
                 }
-            }
-
-            self.rescan();
-            if self.used_bytes() < self.max_size_bytes {
-                return Ok(());
+                self.rescan();
+                if fits(self) {
+                    return Ok(());
+                }
             }
         }
         warn!("buffer full, could not evict enough data");
@@ -456,6 +485,53 @@ mod tests {
         assert_eq!(rest.envelopes[0].payload, vec![20]);
         buffer.acknowledge(&rest).expect("ack");
         assert_eq!(buffer.used_bytes(), 0);
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+    #[test]
+    fn eviction_never_deletes_higher_priority_data() {
+        let path = std::env::temp_dir().join(format!("dodo-buffer-{}", uuid::Uuid::new_v4()));
+        let buffer = DiskBuffer::new(&BufferConfig {
+            path: path.to_string_lossy().into_owned(),
+            max_size_bytes: 4096,
+            ..Default::default()
+        })
+        .expect("buffer");
+        let mut security = envelope(1);
+        security.signal_type = SignalType::SecurityEvent;
+        security.payload = vec![1; 3000];
+        buffer.write(&[security]).expect("security fits");
+        let mut log = envelope(2);
+        log.signal_type = SignalType::Log;
+        log.payload = vec![2; 2000];
+        assert!(
+            buffer.write(&[log]).is_err(),
+            "log is dropped, not the security record"
+        );
+        assert_eq!(
+            std::fs::read_dir(path.join("p0_security"))
+                .expect("dir")
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+    #[test]
+    fn large_batches_are_split_into_bounded_files() {
+        let path = std::env::temp_dir().join(format!("dodo-buffer-{}", uuid::Uuid::new_v4()));
+        let buffer = DiskBuffer::new(&BufferConfig {
+            path: path.to_string_lossy().into_owned(),
+            max_size_bytes: 8 * 1024 * 1024,
+            ..Default::default()
+        })
+        .expect("buffer");
+        let mut big = envelope(3);
+        big.payload = vec![3; 300 * 1024];
+        buffer.write(&vec![big; 4]).expect("write");
+        let files = std::fs::read_dir(path.join("p2_metric"))
+            .expect("dir")
+            .count();
+        assert_eq!(files, 2);
+        assert_eq!(buffer.peek(10).expect("peek").envelopes.len(), 4);
         std::fs::remove_dir_all(path).expect("cleanup");
     }
     #[test]
