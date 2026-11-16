@@ -85,6 +85,18 @@ impl DiskBuffer {
             })?;
         }
 
+        // A crash between create and rename leaves a `.tmp` file that is never
+        // replayed nor evicted; nothing else writes here at startup.
+        for (dir_name, _) in PRIORITY_DIRS {
+            if let Ok(entries) = std::fs::read_dir(base_path.join(dir_name)) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "tmp") {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
         let buffer = Self {
             base_path,
             max_size_bytes: config.max_size_bytes,
@@ -173,6 +185,19 @@ impl DiskBuffer {
         let path = dir.join(format!("{}_{}.buf", first_timestamp, uuid::Uuid::new_v4()));
         let temporary = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
 
+        let result = Self::write_temporary(&temporary, data)
+            .and_then(|()| std::fs::rename(&temporary, &path).map_err(TransportError::from));
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        // Persist the directory entry as well as the record contents.
+        sync_directory(&dir)?;
+        self.used.fetch_add(size, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn write_temporary(temporary: &std::path::Path, data: &[u8]) -> TransportResult<()> {
         let mut options = std::fs::OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
@@ -181,7 +206,7 @@ impl DiskBuffer {
             options.mode(0o600);
         }
         let file = options
-            .open(&temporary)
+            .open(temporary)
             .map_err(|e| TransportError::Buffer(format!("cannot create buffer record: {e}")))?;
         let mut writer = BufWriter::new(file);
         writer
@@ -193,10 +218,6 @@ impl DiskBuffer {
         // fsync for crash safety
         file.sync_all()
             .map_err(|e| TransportError::Buffer(format!("fsync error: {e}")))?;
-        std::fs::rename(&temporary, &path)?;
-        // Persist the directory entry as well as the record contents.
-        sync_directory(&dir)?;
-        self.used.fetch_add(size, Ordering::Relaxed);
         Ok(())
     }
 
@@ -319,7 +340,10 @@ impl DiskBuffer {
         for (dir_name, _) in PRIORITY_DIRS {
             let dir = self.base_path.join(dir_name);
             if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
+                for entry in entries
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "buf"))
+                {
                     if let Ok(meta) = entry.metadata() {
                         total += meta.len();
                     }
