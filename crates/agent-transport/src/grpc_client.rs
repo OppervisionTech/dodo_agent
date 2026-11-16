@@ -6,6 +6,35 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+/// Upper bound for one SubmitBatch request, under the ingestor's 4 MB default.
+const MAX_REQUEST_BYTES: usize = 3 * 1024 * 1024;
+
+/// Split envelopes into chunks whose encoded size stays under `max_bytes`.
+/// A single envelope larger than the limit goes alone (the server decides).
+fn split_by_size(
+    envelopes: Vec<proto::AgentEnvelope>,
+    max_bytes: usize,
+) -> Vec<Vec<proto::AgentEnvelope>> {
+    use prost::Message;
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut size = 0usize;
+    for env in envelopes {
+        // field tag + length prefix per repeated element
+        let len = env.encoded_len() + 10;
+        if !current.is_empty() && size + len > max_bytes {
+            chunks.push(std::mem::take(&mut current));
+            size = 0;
+        }
+        size += len;
+        current.push(env);
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// gRPC client for submitting batches to the Ingestor via Kong.
 pub struct GrpcClient {
     config: TransportConfig,
@@ -53,15 +82,37 @@ impl GrpcClient {
             base_backoff_ms: self.config.retry_backoff_ms,
         };
 
-        let result = with_retry(&retry_config, "submit_batch", || {
-            let batch = proto_envelopes.clone();
-            let this = &self;
-            async move {
-                let channel = this.ensure_connected().await?;
-                this.do_submit(channel, batch).await
+        // The ingestor rejects requests above its gRPC limit (4 MB by
+        // default) as non-retryable, so a busy node's log batch would never
+        // drain. Send it in size-bounded chunks instead.
+        let mut result: TransportResult<SubmitResult> = Ok(SubmitResult {
+            accepted: 0,
+            rejected: 0,
+            errors: Vec::new(),
+        });
+        for chunk in split_by_size(proto_envelopes, MAX_REQUEST_BYTES) {
+            let part = with_retry(&retry_config, "submit_batch", || {
+                let batch = chunk.clone();
+                let this = &self;
+                async move {
+                    let channel = this.ensure_connected().await?;
+                    this.do_submit(channel, batch).await
+                }
+            })
+            .await;
+            match (&mut result, part) {
+                (Ok(total), Ok(p)) => {
+                    total.accepted += p.accepted;
+                    total.rejected += p.rejected;
+                    total.errors.extend(p.errors);
+                }
+                (_, Err(e)) => {
+                    result = Err(e);
+                    break;
+                }
+                _ => {}
             }
-        })
-        .await;
+        }
 
         let elapsed = start.elapsed();
         match &result {
@@ -168,6 +219,22 @@ impl GrpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_oversized_batches_by_encoded_size() {
+        let env = |n: usize| proto::AgentEnvelope {
+            payload: vec![7; n],
+            ..Default::default()
+        };
+        let chunks = split_by_size((0..10).map(|_| env(1000)).collect(), 3000);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 10);
+        for c in &chunks {
+            let bytes: usize = c.iter().map(|e| prost::Message::encoded_len(e) + 10).sum();
+            assert!(bytes <= 3000 || c.len() == 1);
+        }
+        assert_eq!(split_by_size(vec![], 3000).len(), 1);
+    }
     use prost::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
