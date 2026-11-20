@@ -58,6 +58,10 @@ DODO_ENDPOINT="${DODO_ENDPOINT:-}"
 DODO_ENROLLMENT_ENDPOINT="${DODO_ENROLLMENT_ENDPOINT:-}"
 DODO_VARIANT="${DODO_VARIANT:-}"
 DODO_VERSION="${DODO_VERSION:-latest}"
+DODO_ALLOW_SCRIPTS="${DODO_ALLOW_SCRIPTS:-false}"
+DODO_ALLOW_HTTP="${DODO_ALLOW_HTTP:-false}"
+DODO_HTTP_ALLOW="${DODO_HTTP_ALLOW:-}"
+DODO_SCRIPT_USER="${DODO_SCRIPT_USER:-}"
 DODO_NAMESPACE="${DODO_NAMESPACE:-dodo}"
 DODO_TLS_SECRET="${DODO_TLS_SECRET:-}"
 DODO_NON_INTERACTIVE="${DODO_NON_INTERACTIVE:-false}"
@@ -87,6 +91,11 @@ Options (each also settable as an env var, e.g. DODO_MODE):
   --namespace NAME             Kubernetes namespace (k8s mode)
   --tls-secret NAME            pre-provisioned TLS secret (k8s mode, air-gapped)
   --non-interactive            never prompt
+  --allow-scripts              server mode: let DoDo workflows run bash/python/node
+                               scripts on this host (sha256-checked; off by default)
+  --script-user USER           user scripts run as when the agent is root (default nobody)
+  --allow-http HOSTS           server mode: let workflows call these internal APIs from
+                               this host (comma list: host, host:port, *.suffix)
   -h, --help                   show this help
 USAGE
 }
@@ -104,6 +113,9 @@ parse_args() {
       --namespace)           _need_value "$@"; DODO_NAMESPACE="$2";            shift 2 ;;
       --tls-secret)          _need_value "$@"; DODO_TLS_SECRET="$2";           shift 2 ;;
       --non-interactive)     DODO_NON_INTERACTIVE=true;                     shift ;;
+      --allow-scripts)       DODO_ALLOW_SCRIPTS=true;                       shift ;;
+      --script-user)         _need_value "$@"; DODO_SCRIPT_USER="$2";          shift 2 ;;
+      --allow-http)          _need_value "$@"; DODO_ALLOW_HTTP=true; DODO_HTTP_ALLOW="$2"; shift 2 ;;
       -h|--help)             usage; exit 0 ;;
       --)                    shift; break ;;
       *) error "Unknown option: $1 (see the installer reference in the docs)" ;;
@@ -114,6 +126,12 @@ parse_args() {
 # ─── Input Validation ─────────────────────────────────────────────────────────
 
 validate_inputs() {
+  if [[ -n "${DODO_SCRIPT_USER}" && ! "${DODO_SCRIPT_USER}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    error "Invalid --script-user '${DODO_SCRIPT_USER}'"
+  fi
+  if [[ -n "${DODO_HTTP_ALLOW}" && ! "${DODO_HTTP_ALLOW}" =~ ^[A-Za-z0-9.*:,_-]+$ ]]; then
+    error "Invalid --allow-http list (use host, host:port or *.suffix, comma separated)"
+  fi
   if [[ -n "${DODO_MODE}" ]]; then
     case "${DODO_MODE}" in
       server|k8s|dev) ;;
@@ -664,7 +682,16 @@ _write_agent_env() {
   [[ $- == *x* ]] && xtrace_was_on=true
   set +x
   # umask 077: the file is never readable by others, not even briefly.
-  ( umask 077; printf 'DODO_API_KEY=%s\n' "${DODO_API_KEY}" > "${CONFIG_DIR}/agent.env" )
+  ( umask 077
+    printf 'DODO_API_KEY=%s\n' "${DODO_API_KEY}"
+    # Workflow execution on this host (DoDo workflows); off unless asked.
+    [[ "${DODO_ALLOW_SCRIPTS}" == "true" ]] && printf 'DODO_ALLOW_SCRIPTS=true\n'
+    [[ -n "${DODO_SCRIPT_USER}" ]] && printf 'DODO_SCRIPT_USER=%s\n' "${DODO_SCRIPT_USER}"
+    if [[ "${DODO_ALLOW_HTTP}" == "true" && -n "${DODO_HTTP_ALLOW}" ]]; then
+      printf 'DODO_ALLOW_HTTP=true\nDODO_HTTP_ALLOW=%s\n' "${DODO_HTTP_ALLOW}"
+    fi
+    true
+  ) > "${CONFIG_DIR}/agent.env"
   [[ "${xtrace_was_on}" == "true" ]] && set -x
   chmod 600 "${CONFIG_DIR}/agent.env"
   chown "root:${SERVICE_USER}" "${CONFIG_DIR}/agent.env" 2>/dev/null || true

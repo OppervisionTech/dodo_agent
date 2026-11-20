@@ -9,6 +9,8 @@
 
 mod channel;
 mod executor;
+#[cfg(unix)]
+mod host;
 
 pub use channel::CommandChannel;
 pub use executor::CommandExecutor;
