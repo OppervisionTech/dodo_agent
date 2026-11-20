@@ -41,7 +41,8 @@ pub(crate) async fn run(doc: &Value) -> Result<String, CommandError> {
     let spec = doc.get("spec").cloned().unwrap_or(Value::Null);
     match doc.get("kind").and_then(Value::as_str) {
         Some("HostScript") => {
-            run_script(&spec, env_flag("DODO_ALLOW_SCRIPTS"), &script_user()).await
+            let user = script_user();
+            run_script(&spec, env_flag("DODO_ALLOW_SCRIPTS"), Some(&user)).await
         }
         Some("HttpRequest") => {
             let allow = std::env::var("DODO_HTTP_ALLOW").unwrap_or_default();
@@ -71,7 +72,7 @@ fn clip(mut s: String) -> String {
 }
 
 fn script_user() -> String {
-    std::env::var("DODO_SCRIPT_USER").unwrap_or_else(|_| "nobody".into())
+    std::env::var("DODO_SCRIPT_USER").unwrap_or_else(|_| "dodo-script".into())
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -92,34 +93,94 @@ fn valid_env_key(k: &str) -> bool {
         && !matches!(k, "PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH" | "HOME")
 }
 
-/// (uid, gid) of `user` when this process is root; None otherwise.
+/// (uid, gid) scripts run as. Never the agent's own uid (that would expose
+/// /proc/<agent>/environ (the API key) and the agent's files) and never root.
 #[cfg(unix)]
-fn target_ids(user: &str) -> Result<Option<(u32, u32)>, CommandError> {
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(None);
-    }
+fn target_ids(user: &str) -> Result<(u32, u32), CommandError> {
     let name = std::ffi::CString::new(user).map_err(|_| exec_err("invalid DODO_SCRIPT_USER"))?;
-    // SAFETY: getpwnam reads a static buffer; we copy the ids immediately and
-    // this runs on the executor's single command path.
+    // SAFETY: getpwnam returns a pointer to a static passwd buffer or null;
+    // the ids are copied out immediately.
     let pw = unsafe { libc::getpwnam(name.as_ptr()) };
     if pw.is_null() {
         return Err(exec_err(format!(
-            "script user {user:?} not found on this host"
+            "script user {user:?} not found on this host (install with --allow-scripts)"
         )));
     }
     // SAFETY: pw is non-null and points to a valid passwd struct.
     let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
-    if uid == 0 {
-        return Err(exec_err("refusing to run workflow scripts as root"));
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    if uid == 0 || uid == me {
+        return Err(exec_err(
+            "workflow scripts must run as a separate unprivileged user (DODO_SCRIPT_USER)",
+        ));
     }
-    Ok(Some((uid, gid)))
+    Ok((uid, gid))
 }
 
+/// In the forked child, before exec: no privilege gain via exec, and no
+/// capability inherited from the agent (it holds CAP_DAC_READ_SEARCH etc.).
+/// Only async-signal-safe syscalls.
+#[cfg(target_os = "linux")]
+fn drop_privileges_in_child() -> std::io::Result<()> {
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    // SAFETY: plain prctl/capset syscalls on the current (child) process with
+    // valid, stack-owned arguments.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        );
+        let mut hdr = CapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let data = [
+            CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+            CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+        ];
+        if libc::syscall(libc::SYS_capset, &mut hdr as *mut CapHeader, data.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_privileges_in_child() -> std::io::Result<()> {
+    Ok(())
+}
+
+/// `user`: the account scripts run as; `None` only in tests (runs as self).
 pub(crate) async fn run_script(
     spec: &Value,
     allowed: bool,
-    user: &str,
+    user: Option<&str>,
 ) -> Result<String, CommandError> {
     if !allowed {
         return Err(exec_err(
@@ -165,21 +226,34 @@ pub(crate) async fn run_script(
             .create(&dir)
             .map_err(|e| exec_err(format!("create work dir: {e}")))?;
     }
+    let ids = user.map(target_ids).transpose()?;
     let path = dir.join("script");
     std::fs::write(&path, script).map_err(|e| exec_err(format!("write script: {e}")))?;
-    let ids = target_ids(user)?;
-    if let Some((uid, gid)) = ids {
-        use std::os::unix::fs::chown;
-        chown(&dir, Some(uid), Some(gid)).map_err(|e| exec_err(format!("chown: {e}")))?;
-        chown(&path, Some(uid), Some(gid)).map_err(|e| exec_err(format!("chown: {e}")))?;
+    // Work dir the script may write to. The agent can't chown (no
+    // CAP_CHOWN), so when switching users the script stays read-only
+    // (0644, agent-owned) and work/ is world-writable inside this private
+    // 0711 directory under the agent's PrivateTmp.
+    let work = dir.join("work");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(&work).map_err(|e| exec_err(format!("create work dir: {e}")))?;
+        if ids.is_some() {
+            let set = |p: &std::path::Path, m: u32| {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(m))
+                    .map_err(|e| exec_err(format!("chmod: {e}")))
+            };
+            set(&dir, 0o711)?;
+            set(&path, 0o644)?;
+            set(&work, 0o777)?;
+        }
     }
 
     let mut cmd = tokio::process::Command::new(interpreter);
     cmd.arg(&path)
-        .current_dir(&dir)
+        .current_dir(&work)
         .env_clear()
         .env("PATH", SAFE_PATH)
-        .env("HOME", &dir)
+        .env("HOME", &work)
         .env("LANG", "C.UTF-8")
         .envs(&env)
         .stdin(std::process::Stdio::null())
@@ -206,12 +280,18 @@ pub(crate) async fn run_script(
             lim(libc::RLIMIT_NPROC, 64);
             lim(libc::RLIMIT_FSIZE, 50 * 1024 * 1024);
             lim(libc::RLIMIT_CORE, 0);
-            Ok(())
+            drop_privileges_in_child()
         });
     }
-    let child = cmd
-        .spawn()
-        .map_err(|e| exec_err(format!("{interpreter} not available on this host: {e}")))?;
+    let child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied && ids.is_some() {
+            exec_err(format!(
+                "agent cannot switch to the script user: {e} (install with --allow-scripts)"
+            ))
+        } else {
+            exec_err(format!("{interpreter} not available on this host: {e}"))
+        }
+    })?;
     let pid = child.id();
     let out = match tokio::time::timeout(Duration::from_secs(timeout_s), child.wait_with_output())
         .await
@@ -271,6 +351,30 @@ pub(crate) fn host_allowed(allow: &str, host: &str, port: u16) -> bool {
         })
 }
 
+/// Caller-set headers may not steer routing or framing (Host, hop-by-hop,
+/// proxy and forwarding headers).
+pub(crate) fn header_allowed(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    !n.is_empty()
+        && n.len() <= 64
+        && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !matches!(
+            n.as_str(),
+            "host"
+                | "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailer"
+                | "upgrade"
+                | "content-length"
+                | "forwarded"
+                | "via"
+        )
+        && !n.starts_with("proxy-")
+        && !n.starts_with("x-forwarded-")
+}
+
 pub(crate) async fn http_request(
     spec: &Value,
     allowed: bool,
@@ -319,6 +423,9 @@ pub(crate) async fn http_request(
     let mut req = client.request(method, url);
     if let Some(h) = spec.get("headers").and_then(Value::as_object) {
         for (k, v) in h {
+            if !header_allowed(k) {
+                return Err(exec_err(format!("header {k:?} not allowed")));
+            }
             req = req.header(k.as_str(), v.as_str().unwrap_or_default());
         }
     }
@@ -370,25 +477,22 @@ mod tests {
     #[tokio::test]
     async fn script_disabled_or_tampered_is_refused() {
         let s = spec("echo hi");
-        assert!(run_script(&s, false, "nobody").await.is_err());
+        assert!(run_script(&s, false, None).await.is_err());
         let mut bad = s.clone();
         bad["script"] = json!("echo pwned");
-        let err = run_script(&bad, true, "nobody")
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = run_script(&bad, true, None).await.unwrap_err().to_string();
         assert!(err.contains("sha256"), "{err}");
     }
 
     #[tokio::test]
     async fn script_runs_with_clean_env_and_reports_exit() {
         std::env::set_var("DODO_LEAK_TEST", "secret");
-        let ok = run_script(&spec("echo \"svc=$DODO_SERVICE leak=${DODO_LEAK_TEST:-none}\"\necho '{\"healthy\":true}'"), true, "nobody")
+        let ok = run_script(&spec("echo \"svc=$DODO_SERVICE leak=${DODO_LEAK_TEST:-none}\"\necho '{\"healthy\":true}'"), true, None)
             .await
             .unwrap();
         assert!(ok.starts_with("exit=0"), "{ok}");
         assert!(ok.contains("svc=checkout leak=none"), "{ok}");
-        let err = run_script(&spec("echo boom >&2; exit 3"), true, "nobody")
+        let err = run_script(&spec("echo boom >&2; exit 3"), true, None)
             .await
             .unwrap_err()
             .to_string();
@@ -399,10 +503,7 @@ mod tests {
     async fn script_timeout_kills() {
         let mut s = spec("sleep 30");
         s["timeout_s"] = json!(1);
-        let err = run_script(&s, true, "nobody")
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = run_script(&s, true, None).await.unwrap_err().to_string();
         assert!(err.contains("timed out"), "{err}");
     }
 
@@ -410,10 +511,37 @@ mod tests {
     async fn bad_env_and_language_refused() {
         let mut s = spec("true");
         s["env"] = json!({"LD_PRELOAD": "/x.so"});
-        assert!(run_script(&s, true, "nobody").await.is_err());
+        assert!(run_script(&s, true, None).await.is_err());
         let mut s = spec("true");
         s["language"] = json!("ruby");
-        assert!(run_script(&s, true, "nobody").await.is_err());
+        assert!(run_script(&s, true, None).await.is_err());
+    }
+
+    #[test]
+    fn script_user_must_differ_from_agent_and_root() {
+        assert!(target_ids("root").is_err());
+        assert!(target_ids("no-such-user-dodo").is_err());
+        // SAFETY: getpwuid(geteuid()) returns the current user's entry.
+        let me = unsafe { std::ffi::CStr::from_ptr((*libc::getpwuid(libc::geteuid())).pw_name) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(target_ids(&me).is_err());
+    }
+
+    #[test]
+    fn routing_headers_refused() {
+        for h in [
+            "Host",
+            "Connection",
+            "Transfer-Encoding",
+            "Proxy-Authorization",
+            "X-Forwarded-For",
+            "bad header",
+        ] {
+            assert!(!header_allowed(h), "{h}");
+        }
+        assert!(header_allowed("Authorization"));
+        assert!(header_allowed("X-Api-Key"));
     }
 
     #[test]

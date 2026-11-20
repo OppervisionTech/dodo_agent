@@ -682,7 +682,7 @@ _write_agent_env() {
   [[ $- == *x* ]] && xtrace_was_on=true
   set +x
   # umask 077: the file is never readable by others, not even briefly.
-  ( umask 077
+  ( umask 077; {
     printf 'DODO_API_KEY=%s\n' "${DODO_API_KEY}"
     # Workflow execution on this host (DoDo workflows); off unless asked.
     [[ "${DODO_ALLOW_SCRIPTS}" == "true" ]] && printf 'DODO_ALLOW_SCRIPTS=true\n'
@@ -691,7 +691,7 @@ _write_agent_env() {
       printf 'DODO_ALLOW_HTTP=true\nDODO_HTTP_ALLOW=%s\n' "${DODO_HTTP_ALLOW}"
     fi
     true
-  ) > "${CONFIG_DIR}/agent.env"
+  } > "${CONFIG_DIR}/agent.env" )
   [[ "${xtrace_was_on}" == "true" ]] && set -x
   chmod 600 "${CONFIG_DIR}/agent.env"
   chown "root:${SERVICE_USER}" "${CONFIG_DIR}/agent.env" 2>/dev/null || true
@@ -766,6 +766,15 @@ server() {
   else
     ok "User '${SERVICE_USER}' already exists"
   fi
+  if [[ "${DODO_ALLOW_SCRIPTS}" == "true" ]]; then
+    # Workflow scripts never run as the agent's user (it can read the API
+    # key); they run as this separate, unprivileged, login-less account.
+    local script_user="${DODO_SCRIPT_USER:-dodo-script}"
+    if ! id "${script_user}" &>/dev/null; then
+      useradd --system --no-create-home --shell /usr/sbin/nologin "${script_user}"
+      ok "User '${script_user}' created (workflow scripts)"
+    fi
+  fi
 
   step "Creating directories"
   mkdir -p "${INSTALL_DIR}" "${CONFIG_DIR}" "${CERTS_DIR}" \
@@ -814,6 +823,11 @@ server() {
   if command -v systemctl >/dev/null 2>&1; then
     step "Installing systemd service"
     _write_systemd_unit
+    if [[ "${DODO_ALLOW_SCRIPTS}" == "true" ]]; then
+      # Only to switch to the script user; the child drops every capability.
+      sed -i 's/^\(AmbientCapabilities=.*\)$/\1 CAP_SETUID CAP_SETGID/; s/^\(CapabilityBoundingSet=.*\)$/\1 CAP_SETUID CAP_SETGID/' \
+        /etc/systemd/system/aegis-agent.service
+    fi
     systemctl daemon-reload
     systemctl enable aegis-agent
     ok "Service enabled (aegis-agent)"
