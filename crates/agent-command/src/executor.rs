@@ -26,6 +26,91 @@ impl Default for CommandExecutor {
     }
 }
 
+/// Label the platform puts on workflow-script manifests (ConfigMap + Job).
+const SCRIPT_LABEL: &str = "dodo.io/script";
+/// Annotation on the Job holding the SHA-256 of the script it runs.
+const SCRIPT_SHA_ANNOTATION: &str = "dodo.io/script-sha256";
+
+/// Customer-side switch: workflow scripts run only when the operator set
+/// DODO_ALLOW_SCRIPTS=true on this agent (Helm value `allowScripts`).
+fn scripts_allowed() -> bool {
+    std::env::var("DODO_ALLOW_SCRIPTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// A manifest carrying a workflow script must: be allowed by the operator,
+/// contain only one ConfigMap (data.script) and one Job (both labelled), and
+/// the script must match the SHA-256 the platform signed off when the
+/// workflow was saved. Other manifests pass through unchanged.
+pub(crate) fn check_script_manifest(manifest: &[u8], allowed: bool) -> Result<(), CommandError> {
+    let text = String::from_utf8_lossy(manifest);
+    if !text.contains(SCRIPT_LABEL) {
+        return Ok(());
+    }
+    if !allowed {
+        return Err(CommandError::Execution(
+            "workflow scripts are disabled on this agent (set DODO_ALLOW_SCRIPTS=true)".into(),
+        ));
+    }
+    let doc: serde_json::Value = serde_json::from_slice(manifest)
+        .map_err(|_| CommandError::Execution("script manifest must be a JSON List".into()))?;
+    let items = doc
+        .get("items")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| CommandError::Execution("script manifest must be a List".into()))?;
+    if items.len() != 2 {
+        return Err(CommandError::Execution(
+            "script manifest must hold ConfigMap + Job".into(),
+        ));
+    }
+    let mut script: Option<&str> = None;
+    let mut expected: Option<&str> = None;
+    for item in items {
+        let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let labelled = item
+            .pointer("/metadata/labels")
+            .and_then(|l| l.get(SCRIPT_LABEL))
+            .and_then(|v| v.as_str())
+            == Some("true");
+        if !labelled {
+            return Err(CommandError::Execution(
+                "unlabelled object in script manifest".into(),
+            ));
+        }
+        match kind {
+            "ConfigMap" => script = item.pointer("/data/script").and_then(|v| v.as_str()),
+            "Job" => {
+                expected = item
+                    .pointer("/metadata/annotations")
+                    .and_then(|a| a.get(SCRIPT_SHA_ANNOTATION))
+                    .and_then(|v| v.as_str())
+            }
+            other => {
+                return Err(CommandError::Execution(format!(
+                    "kind {other} not allowed in script manifest"
+                )))
+            }
+        }
+    }
+    let (Some(script), Some(expected)) = (script, expected) else {
+        return Err(CommandError::Execution(
+            "script or its sha256 missing".into(),
+        ));
+    };
+    use sha2::{Digest, Sha256};
+    let actual: String = Sha256::digest(script.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(CommandError::Execution(
+            "script sha256 mismatch — refused".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl CommandExecutor {
     pub async fn execute(
         &self,
@@ -132,6 +217,7 @@ impl CommandExecutor {
         // Decode base64 manifest
         let manifest_bytes = base64_decode(&cmd.manifest_yaml_b64)
             .map_err(|e| CommandError::Execution(format!("base64 decode failed: {e}")))?;
+        check_script_manifest(&manifest_bytes, scripts_allowed())?;
 
         // Write to a temp file
         let mut tmp = tempfile()?;
@@ -844,5 +930,60 @@ mod tests {
         }
         assert!(!path.exists());
         assert_eq!(base64_decode("aG Vs\nbG8=\r").unwrap(), b"hello");
+    }
+}
+
+#[cfg(test)]
+mod script_manifest_tests {
+    use super::check_script_manifest;
+    use sha2::{Digest, Sha256};
+
+    fn manifest(script: &str, sha: &str, extra_kind: Option<&str>) -> Vec<u8> {
+        let second = extra_kind.unwrap_or("Job");
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "List",
+            "items": [
+                {"apiVersion": "v1", "kind": "ConfigMap",
+                 "metadata": {"name": "s", "labels": {"dodo.io/script": "true"}},
+                 "data": {"script": script}},
+                {"apiVersion": "batch/v1", "kind": second,
+                 "metadata": {"name": "j", "labels": {"dodo.io/script": "true"},
+                              "annotations": {"dodo.io/script-sha256": sha}}}
+            ]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn sha(s: &str) -> String {
+        Sha256::digest(s.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn plain_manifest_passes() {
+        assert!(check_script_manifest(b"kind: ConfigMap", false).is_ok());
+    }
+
+    #[test]
+    fn script_needs_opt_in() {
+        let m = manifest("echo hi", &sha("echo hi"), None);
+        assert!(check_script_manifest(&m, false).is_err());
+        assert!(check_script_manifest(&m, true).is_ok());
+    }
+
+    #[test]
+    fn tampered_script_refused() {
+        let m = manifest("rm -rf /", &sha("echo hi"), None);
+        assert!(check_script_manifest(&m, true).is_err());
+    }
+
+    #[test]
+    fn other_kinds_refused() {
+        let m = manifest("echo hi", &sha("echo hi"), Some("ClusterRoleBinding"));
+        assert!(check_script_manifest(&m, true).is_err());
     }
 }

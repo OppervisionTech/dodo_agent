@@ -4,6 +4,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 mod health;
+mod updater;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -296,6 +297,15 @@ async fn main() -> Result<()> {
     let mut cmd_transport_config = transport_config.clone();
     cmd_transport_config.timeout_ms = 0;
     let cmd_agent_id = agent_state.agent_id.clone();
+    // Self-update (binary installs only; DODO_UPDATE_URL opts in).
+    if let Some(update_cfg) = updater::UpdaterConfig::from_env() {
+        tokio::spawn(updater::run(
+            update_cfg,
+            AGENT_VERSION,
+            cancel_token.clone(),
+        ));
+    }
+
     let cmd_cancel = cancel_token.clone();
     let command_channel_handle = tokio::spawn(async move {
         let channel = agent_command::CommandChannel::new(cmd_agent_id, cmd_transport_config);
