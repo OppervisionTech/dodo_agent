@@ -16,10 +16,11 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+reqwest = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 h2 = "0.4"
 http = "1"
-libc = "0.2"
 prost = { workspace = true }
