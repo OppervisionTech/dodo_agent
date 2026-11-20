@@ -12,7 +12,11 @@
 //!   3. with `DODO_AUTO_UPDATE=notify` (default) it only logs that an update
 //!      is available — the dashboard shows it from the heartbeat version.
 //!
-//! Nothing runs unless `DODO_UPDATE_URL` is set.
+//! Nothing runs unless `DODO_UPDATE_URL` is set. Auto-install additionally
+//! needs an Ed25519 release public key compiled in (`DODO_RELEASE_PUBKEY`,
+//! hex, set by the release CI): every artifact must carry a signature by the
+//! matching private key, so a compromised release server or metadata
+//! endpoint cannot push a binary. Without the key the agent only notifies.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -76,6 +80,37 @@ pub struct Release {
     pub version: String,
     pub url: String,
     pub sha256: String,
+    pub signature: String,
+}
+
+/// Ed25519 public key (hex) of the release signer, baked in at build time.
+const RELEASE_PUBKEY: Option<&str> = option_env!("DODO_RELEASE_PUBKEY");
+/// Artifacts are only fetched from the release host.
+const ALLOWED_URL_PREFIXES: &[&str] = &["https://github.com/OppervisionTech/dodo-agent-releases/"];
+const MAX_ARTIFACT_BYTES: usize = 150 * 1024 * 1024;
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Checks `signature` (hex Ed25519) over `bytes` with the public key `pubkey_hex`.
+pub fn verify_signature(bytes: &[u8], signature: &str, pubkey_hex: &str) -> bool {
+    let (Some(sig), Some(key)) = (hex_decode(signature), hex_decode(pubkey_hex)) else {
+        return false;
+    };
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+        .verify(bytes, &sig)
+        .is_ok()
+}
+
+pub fn url_allowed(url: &str) -> bool {
+    ALLOWED_URL_PREFIXES.iter().any(|p| url.starts_with(p))
 }
 
 /// Picks the artifact for `target` out of the release JSON
@@ -85,6 +120,11 @@ pub fn parse_release(body: &serde_json::Value, target: &str) -> Option<Release> 
     let art = body.get("artifacts")?.get(target)?;
     let url = art.get("url")?.as_str()?.to_string();
     let sha256 = art.get("sha256")?.as_str()?.to_ascii_lowercase();
+    let signature = art
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if !url.starts_with("https://") || sha256.len() != 64 {
         return None;
     }
@@ -92,6 +132,7 @@ pub fn parse_release(body: &serde_json::Value, target: &str) -> Option<Release> 
         version,
         url,
         sha256,
+        signature,
     })
 }
 
@@ -212,20 +253,34 @@ async fn check_once(
     if !is_newer(&release.version, current) {
         return Ok(false);
     }
-    if cfg.mode == Mode::Notify {
+    let pubkey = RELEASE_PUBKEY.filter(|k| k.len() == 64);
+    if cfg.mode == Mode::Notify || pubkey.is_none() {
+        if cfg.mode == Mode::Auto {
+            warn!("auto-update needs a build with DODO_RELEASE_PUBKEY — notifying only");
+        }
         info!(current, available = %release.version, "agent update available");
         return Ok(false);
     }
+    if !url_allowed(&release.url) {
+        anyhow::bail!("artifact URL outside the release host — refused");
+    }
     info!(current, version = %release.version, "downloading agent update");
-    let bytes = client
-        .get(&release.url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let mut resp = client.get(&release.url).send().await?.error_for_status()?;
+    if resp.content_length().unwrap_or(0) as usize > MAX_ARTIFACT_BYTES {
+        anyhow::bail!("artifact too large");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            anyhow::bail!("artifact too large");
+        }
+    }
     if !verify_sha256(&bytes, &release.sha256) {
         anyhow::bail!("downloaded agent does not match published sha256 — refused");
+    }
+    if !verify_signature(&bytes, &release.signature, pubkey.unwrap_or_default()) {
+        anyhow::bail!("artifact signature invalid — refused");
     }
     let exe = std::env::current_exe()?;
     swap_executable(&exe, &bytes)?;
@@ -255,6 +310,24 @@ mod tests {
         let http = serde_json::json!({"version": "1", "artifacts": {
             "t": {"url": "http://x", "sha256": "a".repeat(64)}}});
         assert!(parse_release(&http, "t").is_none());
+    }
+
+    #[test]
+    fn signatures() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let pk = hex(kp.public_key().as_ref());
+        let sig = hex(kp.sign(b"binary").as_ref());
+        assert!(verify_signature(b"binary", &sig, &pk));
+        assert!(!verify_signature(b"evil", &sig, &pk));
+        assert!(!verify_signature(b"binary", "zz", &pk));
+        assert!(url_allowed(
+            "https://github.com/OppervisionTech/dodo-agent-releases/releases/download/v1/a"
+        ));
+        assert!(!url_allowed("https://evil.example/agent"));
     }
 
     #[test]
