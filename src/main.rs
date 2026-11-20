@@ -13,6 +13,7 @@ const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, PartialEq)]
 enum CliAction {
     Run,
+    ScriptRunner,
     Version,
     Help,
     Unknown(String),
@@ -22,6 +23,7 @@ fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> CliAction {
     match args.into_iter().nth(1).as_deref() {
         None => CliAction::Run,
         Some("--version" | "-V") => CliAction::Version,
+        Some("--script-runner") => CliAction::ScriptRunner,
         Some("--help" | "-h") => CliAction::Help,
         Some(other) => CliAction::Unknown(other.to_string()),
     }
@@ -30,7 +32,7 @@ fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> CliAction {
 fn usage() -> String {
     format!(
         "aegis-agent {AGENT_VERSION} ({variant})\n\n\
-         Usage: aegis-agent [--version | --help]\n\n\
+         Usage: aegis-agent [--version | --help | --script-runner]\n\n\
          Configuration is read from $AEGIS_CONFIG (default /etc/aegis/agent.yaml).\n\
          The API key for certificate enrollment is read from $DODO_API_KEY.\n",
         variant = agent_variant()
@@ -41,6 +43,15 @@ fn usage() -> String {
 async fn main() -> Result<()> {
     match parse_cli(std::env::args()) {
         CliAction::Run => {}
+        CliAction::ScriptRunner => {
+            tracing_subscriber::fmt().with_env_filter("info").init();
+            #[cfg(unix)]
+            if let Err(e) = agent_command::serve_script_runner().await {
+                eprintln!("aegis-agent --script-runner: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         CliAction::Version => {
             println!("aegis-agent {AGENT_VERSION} ({})", agent_variant());
             return Ok(());

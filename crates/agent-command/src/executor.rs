@@ -217,6 +217,11 @@ impl CommandExecutor {
         // Decode base64 manifest
         let manifest_bytes = base64_decode(&cmd.manifest_yaml_b64)
             .map_err(|e| CommandError::Execution(format!("base64 decode failed: {e}")))?;
+        // VM/host workflow commands (dodo.io/v1) never reach kubectl.
+        #[cfg(unix)]
+        if let Some(doc) = crate::host::parse(&manifest_bytes) {
+            return crate::host::run(&doc).await;
+        }
         check_script_manifest(&manifest_bytes, scripts_allowed())?;
 
         // Write to a temp file

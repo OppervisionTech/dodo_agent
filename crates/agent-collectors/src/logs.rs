@@ -215,38 +215,88 @@ impl LogsCollector {
         }
     }
 
+    /// Strip the CRI container-log prefix (`<rfc3339> <stdout|stderr> <F|P> `)
+    /// so format and level detection see the application's own text. The
+    /// stream name must never decide the level: "stderr" used to match "ERR".
+    fn cri_body(line: &str) -> &str {
+        let mut parts = line.splitn(4, ' ');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(ts), Some("stdout" | "stderr"), Some("F" | "P"), Some(body))
+                if ts.len() >= 20 && ts.as_bytes()[4] == b'-' =>
+            {
+                body
+            }
+            _ => line,
+        }
+    }
+
     /// Extract severity from a log line (best effort).
     fn extract_severity(line: &str, format: LogFormat) -> &'static str {
-        match format {
-            LogFormat::Json => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(level) = v
-                        .get("level")
-                        .or_else(|| v.get("severity"))
-                        .or_else(|| v.get("log.level"))
-                        .and_then(|v| v.as_str())
-                    {
-                        return Self::normalize_severity(level);
-                    }
-                }
-                "INFO"
-            }
-            _ => {
-                let upper = line.to_uppercase();
-                if upper.contains("FATAL") || upper.contains("PANIC") || upper.contains("CRIT") {
-                    "FATAL"
-                } else if upper.contains("ERROR") || upper.contains("ERR") {
-                    "ERROR"
-                } else if upper.contains("WARN") {
-                    "WARN"
-                } else if upper.contains("DEBUG") {
-                    "DEBUG"
-                } else if upper.contains("TRACE") {
-                    "TRACE"
-                } else {
-                    "INFO"
+        let body = Self::cri_body(line).trim_start();
+        if let LogFormat::Json = format {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                if let Some(level) = v
+                    .get("level")
+                    .or_else(|| v.get("severity"))
+                    .or_else(|| v.get("log.level"))
+                    .or_else(|| v.get("lvl"))
+                    .and_then(|v| v.as_str())
+                {
+                    return Self::normalize_severity(level);
                 }
             }
+            return "INFO";
+        }
+        // klog: "I1120 14:10:39.513594 ..." (I/W/E/F + MMDD + space)
+        let b = body.as_bytes();
+        if b.len() > 6 && b[1..5].iter().all(u8::is_ascii_digit) && b[5] == b' ' {
+            match b[0] {
+                b'I' => return "INFO",
+                b'W' => return "WARN",
+                b'E' => return "ERROR",
+                b'F' => return "FATAL",
+                _ => {}
+            }
+        }
+        // logfmt level=x / lvl=x
+        for kv in body.split_whitespace() {
+            if let Some(v) = kv
+                .strip_prefix("level=")
+                .or_else(|| kv.strip_prefix("lvl="))
+            {
+                return Self::normalize_severity(v.trim_matches('"'));
+            }
+        }
+        // First level-looking word among the leading tokens ("[notice]",
+        // "INFO:", "2026/11/20 14:07:15 [error]", "WARNING ...").
+        for tok in body
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .filter(|t| !t.is_empty())
+            .take(12)
+        {
+            match tok.to_ascii_uppercase().as_str() {
+                "TRACE" => return "TRACE",
+                "DEBUG" => return "DEBUG",
+                "INFO" | "NOTICE" => return "INFO",
+                "WARN" | "WARNING" => return "WARN",
+                "ERROR" | "ERR" => return "ERROR",
+                "FATAL" | "PANIC" | "CRITICAL" | "CRIT" | "EMERG" | "ALERT" => return "FATAL",
+                _ => {}
+            }
+        }
+        // No marker: only unmistakable failure words make it an error.
+        let upper = body.to_ascii_uppercase();
+        if upper.contains("PANIC:") || upper.contains("FATAL") {
+            "FATAL"
+        } else if upper.contains("TRACEBACK (MOST RECENT CALL LAST)")
+            || upper.contains("EXCEPTION")
+            || upper
+                .split(|c: char| !c.is_ascii_alphabetic())
+                .any(|w| w.ends_with("ERROR") || w.ends_with("EXCEPTION"))
+        {
+            "ERROR"
+        } else {
+            "INFO"
         }
     }
 
@@ -356,7 +406,7 @@ impl Collector for LogsCollector {
                         continue;
                     }
 
-                    let format = Self::detect_format(line);
+                    let format = Self::detect_format(Self::cri_body(line));
                     let severity = Self::extract_severity(line, format);
                     let (trace_id, span_id) = Self::extract_trace_context(line);
 
@@ -457,6 +507,26 @@ mod tests {
             LogsCollector::extract_severity("ERROR: something failed", LogFormat::Plaintext),
             "ERROR"
         );
+    }
+
+    #[test]
+    fn severity_ignores_cri_stream_and_reads_the_body() {
+        let cases = [
+            ("2026-11-20T14:10:39.514378035Z stderr F I1120 14:10:39.513594 1 leaderelection.go:271] ok", "INFO"),
+            ("2026-11-20T14:07:15.855314846Z stderr F 2026/11/20 14:07:15 [notice] 1407#0: purge", "INFO"),
+            ("2026-11-20T14:01:01.584805316Z stderr F HTTP Request: GET http://x \"HTTP/1.1 200 OK\"", "INFO"),
+            ("2026-11-20T14:10:44.642510933Z stdout F {\"level\":\"WARN\",\"msg\":\"reconnecting\"}", "WARN"),
+            ("2026-11-20T14:11:11.479806992Z stderr F TypeError: fetch failed", "ERROR"),
+            ("2026-11-20T14:11:11.479806992Z stderr F served 3 requests, errors=0", "INFO"),
+            ("2026-11-20T14:11:11.479806992Z stderr F E1120 14:10:39.5 1 x.go:1] sync failed", "ERROR"),
+            ("2026-11-20T14:11:11.479806992Z stderr F Traceback (most recent call last):", "ERROR"),
+            ("time=1 level=error msg=boom", "ERROR"),
+            ("2026/11/20 [error] 12#0: upstream timed out", "ERROR"),
+        ];
+        for (line, want) in cases {
+            let fmt = LogsCollector::detect_format(LogsCollector::cri_body(line));
+            assert_eq!(LogsCollector::extract_severity(line, fmt), want, "{line}");
+        }
     }
 
     #[test]
