@@ -284,7 +284,8 @@ impl LogsCollector {
                 "INFO" | "NOTICE" => return "INFO",
                 "WARN" | "WARNING" => return "WARN",
                 "ERROR" | "ERR" => return "ERROR",
-                "FATAL" | "PANIC" | "CRITICAL" | "CRIT" | "EMERG" | "ALERT" => return "FATAL",
+                // No bare "ALERT": too common a word ("alert-events" topics).
+                "FATAL" | "PANIC" | "CRITICAL" | "CRIT" | "EMERG" => return "FATAL",
                 _ => {}
             }
         }
@@ -529,6 +530,7 @@ mod tests {
             ("time=1 level=error msg=boom", "ERROR"),
             ("2026-11-20T20:30:00.1Z stderr F HTTP Request: POST http://ch:8123/?database=dodo_logs&param_not_error_re=x \"HTTP/1.1 200 OK\"", "INFO"),
             ("2026-11-20T20:30:00.1Z stderr F GET /api/errors/list 200", "INFO"),
+            ("2026-11-20T21:23:00.1Z stderr F Updating subscribed topics to: frozenset({'alert-events'})", "INFO"),
             ("2026/11/20 [error] 12#0: upstream timed out", "ERROR"),
         ];
         for (line, want) in cases {
