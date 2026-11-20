@@ -260,7 +260,10 @@ impl LogsCollector {
         }
         // logfmt level=x / lvl=x
         for kv in body.split_whitespace() {
-            if let Some(v) = kv.strip_prefix("level=").or_else(|| kv.strip_prefix("lvl=")) {
+            if let Some(v) = kv
+                .strip_prefix("level=")
+                .or_else(|| kv.strip_prefix("lvl="))
+            {
                 return Self::normalize_severity(v.trim_matches('"'));
             }
         }

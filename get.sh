@@ -698,6 +698,46 @@ _write_agent_env() {
   ok "Agent env file written: ${CONFIG_DIR}/agent.env (mode 600)"
 }
 
+# Workflow scripts never run inside the agent (it holds capabilities and the
+# API key). A separate service, as the unprivileged script user with no
+# capabilities, takes hash-checked scripts from the agent over a unix socket
+# and only accepts the agent's uid (SO_PEERCRED).
+_write_script_runner_unit() {
+  local script_user="${DODO_SCRIPT_USER:-dodo-script}"
+  cat > /etc/systemd/system/dodo-script-runner.service << UNIT
+[Unit]
+Description=DoDo workflow script runner (runs scripts sent by aegis-agent)
+After=network-online.target
+Before=aegis-agent.service
+
+[Service]
+Type=simple
+User=${script_user}
+Group=${script_user}
+ExecStart=/usr/local/bin/aegis-agent --script-runner
+Environment=DODO_SCRIPT_CLIENT_USER=${SERVICE_USER}
+RuntimeDirectory=dodo-script
+RuntimeDirectoryMode=0755
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectHome=read-only
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  # The agent (ProtectSystem=strict) must reach the runner's socket.
+  sed -i 's|^ReadWritePaths=/var/lib/aegis /var/log/aegis$|ReadWritePaths=/var/lib/aegis /var/log/aegis -/run/dodo-script|' \
+    /etc/systemd/system/aegis-agent.service
+  systemctl daemon-reload
+  systemctl enable --now dodo-script-runner
+  ok "Script runner enabled (dodo-script-runner, user ${script_user})"
+}
+
 _write_systemd_unit() {
   cat > /etc/systemd/system/aegis-agent.service << 'UNIT'
 [Unit]
@@ -768,7 +808,7 @@ server() {
   fi
   if [[ "${DODO_ALLOW_SCRIPTS}" == "true" ]]; then
     # Workflow scripts never run as the agent's user (it can read the API
-    # key); they run as this separate, unprivileged, login-less account.
+    # key); the script runner service runs as this unprivileged account.
     local script_user="${DODO_SCRIPT_USER:-dodo-script}"
     if ! id "${script_user}" &>/dev/null; then
       useradd --system --no-create-home --shell /usr/sbin/nologin "${script_user}"
@@ -824,9 +864,7 @@ server() {
     step "Installing systemd service"
     _write_systemd_unit
     if [[ "${DODO_ALLOW_SCRIPTS}" == "true" ]]; then
-      # Only to switch to the script user; the child drops every capability.
-      sed -i 's/^\(AmbientCapabilities=.*\)$/\1 CAP_SETUID CAP_SETGID/; s/^\(CapabilityBoundingSet=.*\)$/\1 CAP_SETUID CAP_SETGID/' \
-        /etc/systemd/system/aegis-agent.service
+      _write_script_runner_unit
     fi
     systemctl daemon-reload
     systemctl enable aegis-agent

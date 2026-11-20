@@ -5,9 +5,13 @@
 //!
 //! - `HostScript` runs a bash/python/node script the platform hashed when the
 //!   workflow was saved. Needs `DODO_ALLOW_SCRIPTS=true` and a matching
-//!   SHA-256. Runs in a private temp dir with a clean environment, rlimits, a
-//!   hard timeout that kills the whole process group and, when the agent is
-//!   root, as `DODO_SCRIPT_USER` (default `nobody`).
+//!   SHA-256. The agent never runs it itself: it hands it to the script
+//!   runner (`aegis-agent --script-runner`, a separate service running as the
+//!   unprivileged `dodo-script` user with no capabilities) over a unix
+//!   socket. The runner accepts only the agent's uid (SO_PEERCRED), re-checks
+//!   the hash and runs it in a private temp dir with a clean environment,
+//!   rlimits and a hard timeout that kills the whole process group (same uid,
+//!   so the kill always works).
 //! - `HttpRequest` calls an API from the agent's network (internal APIs the
 //!   platform cannot reach). Needs `DODO_ALLOW_HTTP=true` and the host listed
 //!   in `DODO_HTTP_ALLOW`; everything else is refused.
@@ -41,8 +45,12 @@ pub(crate) async fn run(doc: &Value) -> Result<String, CommandError> {
     let spec = doc.get("spec").cloned().unwrap_or(Value::Null);
     match doc.get("kind").and_then(Value::as_str) {
         Some("HostScript") => {
-            let user = script_user();
-            run_script(&spec, env_flag("DODO_ALLOW_SCRIPTS"), Some(&user)).await
+            if !env_flag("DODO_ALLOW_SCRIPTS") {
+                return Err(exec_err(
+                    "workflow scripts are disabled on this agent (set DODO_ALLOW_SCRIPTS=true)",
+                ));
+            }
+            submit_to_runner(&spec, &script_socket()).await
         }
         Some("HttpRequest") => {
             let allow = std::env::var("DODO_HTTP_ALLOW").unwrap_or_default();
@@ -71,8 +79,122 @@ fn clip(mut s: String) -> String {
     s
 }
 
-fn script_user() -> String {
-    std::env::var("DODO_SCRIPT_USER").unwrap_or_else(|_| "dodo-script".into())
+pub const DEFAULT_SCRIPT_SOCKET: &str = "/run/dodo-script/script.sock";
+const MAX_REQUEST: usize = 1024 * 1024;
+
+fn script_socket() -> String {
+    std::env::var("DODO_SCRIPT_SOCKET").unwrap_or_else(|_| DEFAULT_SCRIPT_SOCKET.into())
+}
+
+/// Agent side: send the script to the runner and wait for its result.
+async fn submit_to_runner(spec: &Value, socket: &str) -> Result<String, CommandError> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let timeout_s = spec
+        .get("timeout_s")
+        .and_then(Value::as_u64)
+        .unwrap_or(300)
+        .clamp(1, MAX_SCRIPT_TIMEOUT);
+    let mut stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| {
+        exec_err(format!(
+            "script runner not reachable at {socket}: {e} (install with --allow-scripts)"
+        ))
+    })?;
+    let mut line = serde_json::to_vec(spec).map_err(|e| exec_err(e.to_string()))?;
+    line.push(b'\n');
+    stream
+        .write_all(&line)
+        .await
+        .map_err(|e| exec_err(format!("send to script runner: {e}")))?;
+    let mut reader = BufReader::new(stream);
+    let mut reply = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(timeout_s + 30),
+        reader.read_line(&mut reply),
+    )
+    .await
+    .map_err(|_| exec_err("script runner did not answer in time"))?
+    .map_err(|e| exec_err(format!("read from script runner: {e}")))?;
+    let v: Value =
+        serde_json::from_str(&reply).map_err(|_| exec_err("bad reply from script runner"))?;
+    let out = v
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if v.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(out)
+    } else {
+        Err(exec_err(out))
+    }
+}
+
+/// uid of a local account.
+fn uid_of(user: &str) -> Option<u32> {
+    let name = std::ffi::CString::new(user).ok()?;
+    // SAFETY: getpwnam returns a static passwd pointer or null; uid copied out.
+    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+    // SAFETY: checked non-null above.
+    (!pw.is_null()).then(|| unsafe { (*pw).pw_uid })
+}
+
+/// `aegis-agent --script-runner`: serve script requests from the agent.
+/// Runs as the unprivileged script user (systemd unit dodo-script-runner).
+pub async fn serve_script_runner() -> anyhow_like::Result {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let socket = script_socket();
+    let client = std::env::var("DODO_SCRIPT_CLIENT_USER").unwrap_or_else(|_| "aegis-agent".into());
+    let client_uid = uid_of(&client).ok_or_else(|| format!("client user {client:?} not found"))?;
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    if me == 0 || me == client_uid {
+        return Err("the script runner must run as its own unprivileged user".into());
+    }
+    let _ = std::fs::remove_file(&socket);
+    let listener =
+        tokio::net::UnixListener::bind(&socket).map_err(|e| format!("bind {socket}: {e}"))?;
+    // Who may connect is decided by SO_PEERCRED below, not file mode.
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
+        .map_err(|e| format!("chmod {socket}: {e}"))?;
+    tracing::info!(socket, client, "script runner listening");
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| format!("accept: {e}"))?;
+        let peer = stream.peer_cred().map(|c| c.uid()).ok();
+        if peer != Some(client_uid) {
+            tracing::warn!(
+                ?peer,
+                "script runner: refused connection from unexpected uid"
+            );
+            continue;
+        }
+        tokio::spawn(async move {
+            let (rd, mut wr) = stream.into_split();
+            let mut reader = BufReader::new(rd.take(MAX_REQUEST as u64));
+            let mut line = String::new();
+            let reply = match reader.read_line(&mut line).await {
+                Ok(_) => match serde_json::from_str::<Value>(&line) {
+                    Ok(spec) => match run_script(&spec, true).await {
+                        Ok(out) => serde_json::json!({"ok": true, "output": out}),
+                        Err(e) => serde_json::json!({"ok": false, "output": e.to_string()}),
+                    },
+                    Err(_) => serde_json::json!({"ok": false, "output": "bad request"}),
+                },
+                Err(e) => serde_json::json!({"ok": false, "output": e.to_string()}),
+            };
+            let mut out = reply.to_string().into_bytes();
+            out.push(b'\n');
+            let _ = wr.write_all(&out).await;
+        });
+    }
+}
+
+/// Error type for the runner entry point (String keeps the crate free of
+/// anyhow in its public API).
+pub mod anyhow_like {
+    pub type Result = std::result::Result<(), String>;
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -91,31 +213,6 @@ fn valid_env_key(k: &str) -> bool {
         && b.iter()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_')
         && !matches!(k, "PATH" | "LD_PRELOAD" | "LD_LIBRARY_PATH" | "HOME")
-}
-
-/// (uid, gid) scripts run as. Never the agent's own uid (that would expose
-/// /proc/<agent>/environ (the API key) and the agent's files) and never root.
-#[cfg(unix)]
-fn target_ids(user: &str) -> Result<(u32, u32), CommandError> {
-    let name = std::ffi::CString::new(user).map_err(|_| exec_err("invalid DODO_SCRIPT_USER"))?;
-    // SAFETY: getpwnam returns a pointer to a static passwd buffer or null;
-    // the ids are copied out immediately.
-    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
-    if pw.is_null() {
-        return Err(exec_err(format!(
-            "script user {user:?} not found on this host (install with --allow-scripts)"
-        )));
-    }
-    // SAFETY: pw is non-null and points to a valid passwd struct.
-    let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
-    // SAFETY: geteuid has no preconditions.
-    let me = unsafe { libc::geteuid() };
-    if uid == 0 || uid == me {
-        return Err(exec_err(
-            "workflow scripts must run as a separate unprivileged user (DODO_SCRIPT_USER)",
-        ));
-    }
-    Ok((uid, gid))
 }
 
 /// In the forked child, before exec: no privilege gain via exec, and no
@@ -176,12 +273,8 @@ fn drop_privileges_in_child() -> std::io::Result<()> {
     Ok(())
 }
 
-/// `user`: the account scripts run as; `None` only in tests (runs as self).
-pub(crate) async fn run_script(
-    spec: &Value,
-    allowed: bool,
-    user: Option<&str>,
-) -> Result<String, CommandError> {
+/// Runs a script as the current user (the script runner's own uid).
+pub(crate) async fn run_script(spec: &Value, allowed: bool) -> Result<String, CommandError> {
     if !allowed {
         return Err(exec_err(
             "workflow scripts are disabled on this agent (set DODO_ALLOW_SCRIPTS=true)",
@@ -226,27 +319,10 @@ pub(crate) async fn run_script(
             .create(&dir)
             .map_err(|e| exec_err(format!("create work dir: {e}")))?;
     }
-    let ids = user.map(target_ids).transpose()?;
     let path = dir.join("script");
     std::fs::write(&path, script).map_err(|e| exec_err(format!("write script: {e}")))?;
-    // Work dir the script may write to. The agent can't chown (no
-    // CAP_CHOWN), so when switching users the script stays read-only
-    // (0644, agent-owned) and work/ is world-writable inside this private
-    // 0711 directory under the agent's PrivateTmp.
     let work = dir.join("work");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir(&work).map_err(|e| exec_err(format!("create work dir: {e}")))?;
-        if ids.is_some() {
-            let set = |p: &std::path::Path, m: u32| {
-                std::fs::set_permissions(p, std::fs::Permissions::from_mode(m))
-                    .map_err(|e| exec_err(format!("chmod: {e}")))
-            };
-            set(&dir, 0o711)?;
-            set(&path, 0o644)?;
-            set(&work, 0o777)?;
-        }
-    }
+    std::fs::create_dir(&work).map_err(|e| exec_err(format!("create work dir: {e}")))?;
 
     let mut cmd = tokio::process::Command::new(interpreter);
     cmd.arg(&path)
@@ -261,9 +337,6 @@ pub(crate) async fn run_script(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .process_group(0);
-    if let Some((uid, gid)) = ids {
-        cmd.uid(uid).gid(gid);
-    }
     let cpu = timeout_s + 5;
     // SAFETY: only async-signal-safe libc calls between fork and exec.
     unsafe {
@@ -283,15 +356,9 @@ pub(crate) async fn run_script(
             drop_privileges_in_child()
         });
     }
-    let child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied && ids.is_some() {
-            exec_err(format!(
-                "agent cannot switch to the script user: {e} (install with --allow-scripts)"
-            ))
-        } else {
-            exec_err(format!("{interpreter} not available on this host: {e}"))
-        }
-    })?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| exec_err(format!("{interpreter} not available on this host: {e}")))?;
     let pid = child.id();
     let out = match tokio::time::timeout(Duration::from_secs(timeout_s), child.wait_with_output())
         .await
@@ -299,8 +366,10 @@ pub(crate) async fn run_script(
         Ok(res) => res.map_err(|e| exec_err(format!("wait: {e}")))?,
         Err(_) => {
             if let Some(pid) = pid {
-                // SAFETY: kill on our own process group.
-                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                // SAFETY: kill on our own process group (same uid as us).
+                if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
+                    tracing::error!(pid, "could not kill timed-out script process group");
+                }
             }
             return Err(exec_err(format!("script timed out after {timeout_s}s")));
         }
@@ -477,22 +546,22 @@ mod tests {
     #[tokio::test]
     async fn script_disabled_or_tampered_is_refused() {
         let s = spec("echo hi");
-        assert!(run_script(&s, false, None).await.is_err());
+        assert!(run_script(&s, false).await.is_err());
         let mut bad = s.clone();
         bad["script"] = json!("echo pwned");
-        let err = run_script(&bad, true, None).await.unwrap_err().to_string();
+        let err = run_script(&bad, true).await.unwrap_err().to_string();
         assert!(err.contains("sha256"), "{err}");
     }
 
     #[tokio::test]
     async fn script_runs_with_clean_env_and_reports_exit() {
         std::env::set_var("DODO_LEAK_TEST", "secret");
-        let ok = run_script(&spec("echo \"svc=$DODO_SERVICE leak=${DODO_LEAK_TEST:-none}\"\necho '{\"healthy\":true}'"), true, None)
+        let ok = run_script(&spec("echo \"svc=$DODO_SERVICE leak=${DODO_LEAK_TEST:-none}\"\necho '{\"healthy\":true}'"), true)
             .await
             .unwrap();
         assert!(ok.starts_with("exit=0"), "{ok}");
         assert!(ok.contains("svc=checkout leak=none"), "{ok}");
-        let err = run_script(&spec("echo boom >&2; exit 3"), true, None)
+        let err = run_script(&spec("echo boom >&2; exit 3"), true)
             .await
             .unwrap_err()
             .to_string();
@@ -503,7 +572,7 @@ mod tests {
     async fn script_timeout_kills() {
         let mut s = spec("sleep 30");
         s["timeout_s"] = json!(1);
-        let err = run_script(&s, true, None).await.unwrap_err().to_string();
+        let err = run_script(&s, true).await.unwrap_err().to_string();
         assert!(err.contains("timed out"), "{err}");
     }
 
@@ -511,21 +580,19 @@ mod tests {
     async fn bad_env_and_language_refused() {
         let mut s = spec("true");
         s["env"] = json!({"LD_PRELOAD": "/x.so"});
-        assert!(run_script(&s, true, None).await.is_err());
+        assert!(run_script(&s, true).await.is_err());
         let mut s = spec("true");
         s["language"] = json!("ruby");
-        assert!(run_script(&s, true, None).await.is_err());
+        assert!(run_script(&s, true).await.is_err());
     }
 
-    #[test]
-    fn script_user_must_differ_from_agent_and_root() {
-        assert!(target_ids("root").is_err());
-        assert!(target_ids("no-such-user-dodo").is_err());
-        // SAFETY: getpwuid(geteuid()) returns the current user's entry.
-        let me = unsafe { std::ffi::CStr::from_ptr((*libc::getpwuid(libc::geteuid())).pw_name) }
-            .to_string_lossy()
-            .into_owned();
-        assert!(target_ids(&me).is_err());
+    #[tokio::test]
+    async fn agent_refuses_without_runner() {
+        let err = submit_to_runner(&spec("true"), "/nonexistent/dodo.sock")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("script runner not reachable"), "{err}");
     }
 
     #[test]

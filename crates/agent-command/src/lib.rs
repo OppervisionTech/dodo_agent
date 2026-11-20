@@ -14,6 +14,8 @@ mod host;
 
 pub use channel::CommandChannel;
 pub use executor::CommandExecutor;
+#[cfg(unix)]
+pub use host::serve_script_runner;
 
 use thiserror::Error;
 
