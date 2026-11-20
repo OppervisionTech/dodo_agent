@@ -680,4 +680,99 @@ mod tests {
         let s = json!({"url": "file:///etc/passwd"});
         assert!(http_request(&s, true, "*").await.is_err());
     }
+
+    async fn one_shot_server(reply: &'static str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let _ = s.write_all(reply.as_bytes()).await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn http_via_agent_calls_allowed_internal_api() {
+        let port = one_shot_server(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}",
+        )
+        .await;
+        let s = json!({"url": format!("http://127.0.0.1:{port}/health"), "method": "POST",
+                       "headers": {"X-Api-Key": "k"}, "body": {"a": 1}, "timeout_s": 5});
+        let out = http_request(&s, true, &format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        assert!(out.starts_with("status=200"), "{out}");
+        assert!(out.contains("{\"ok\":true}"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn http_refuses_bad_method_and_routing_headers() {
+        let s = json!({"url": "http://api.internal/", "method": "TRACE"});
+        assert!(http_request(&s, true, "api.internal").await.is_err());
+        let s = json!({"url": "http://api.internal/", "headers": {"Host": "evil"}});
+        let err = http_request(&s, true, "api.internal")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not allowed"), "{err}");
+        let s = json!({"url": "not a url"});
+        assert!(http_request(&s, true, "*").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_dispatches_by_kind() {
+        let doc = json!({"apiVersion": API_VERSION, "kind": "Nope", "spec": {}});
+        assert!(run(&doc).await.is_err());
+        let doc = json!({"apiVersion": API_VERSION, "kind": "HostScript", "spec": {}});
+        let err = run(&doc).await.unwrap_err().to_string();
+        assert!(err.contains("disabled") || err.contains("runner"), "{err}");
+        let doc =
+            json!({"apiVersion": API_VERSION, "kind": "HttpRequest", "spec": {"url": "http://x/"}});
+        assert!(run(&doc).await.is_err());
+    }
+
+    #[test]
+    fn runner_needs_systemd_socket_unless_dev() {
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("DODO_SCRIPT_SOCKET");
+        assert!(listener_from_systemd("/tmp/x.sock").is_err());
+    }
+
+    #[test]
+    fn clip_and_env_rules() {
+        let long = "é".repeat(MAX_OUTPUT);
+        assert!(clip(long).ends_with("[truncated]"));
+        assert!(valid_env_key("DODO_X1"));
+        assert!(!valid_env_key("lower"));
+        assert!(!valid_env_key("PATH"));
+        assert!(uid_of("root") == Some(0));
+        assert!(uid_of("no-such-user-dodo").is_none());
+    }
+
+    #[tokio::test]
+    async fn runner_rejects_non_json_reply_peer() {
+        // A socket served by our own uid is not the script runner: refused.
+        let dir = std::env::temp_dir().join(format!("dodo-sock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("s.sock");
+        let l = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let _ = l.accept().await;
+        });
+        std::env::set_var("DODO_SCRIPT_USER", "root");
+        let err = submit_to_runner(&spec("true"), path.to_str().unwrap())
+            .await
+            .unwrap_err()
+            .to_string();
+        std::env::remove_var("DODO_SCRIPT_USER");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.contains("not owned by the script user") || err.contains("runner"),
+            "{err}"
+        );
+    }
 }
