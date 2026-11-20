@@ -109,6 +109,16 @@ pub fn verify_signature(bytes: &[u8], signature: &str, pubkey_hex: &str) -> bool
         .is_ok()
 }
 
+/// What the release CI signs for each artifact.
+pub fn signed_message(version: &str, target: &str, sha256: &str) -> String {
+    format!(
+        "dodo-agent-release\n{}\n{}\n{}",
+        version.trim().trim_start_matches('v'),
+        target,
+        sha256.to_ascii_lowercase()
+    )
+}
+
 pub fn url_allowed(url: &str) -> bool {
     ALLOWED_URL_PREFIXES.iter().any(|p| url.starts_with(p))
 }
@@ -279,8 +289,15 @@ async fn check_once(
     if !verify_sha256(&bytes, &release.sha256) {
         anyhow::bail!("downloaded agent does not match published sha256 — refused");
     }
-    if !verify_signature(&bytes, &release.signature, pubkey.unwrap_or_default()) {
-        anyhow::bail!("artifact signature invalid — refused");
+    // The signature covers version + target + sha256, so a valid old or
+    // other-target artifact can't be replayed as this update.
+    let signed = signed_message(&release.version, target, &release.sha256);
+    if !verify_signature(
+        signed.as_bytes(),
+        &release.signature,
+        pubkey.unwrap_or_default(),
+    ) {
+        anyhow::bail!("release signature invalid — refused");
     }
     let exe = std::env::current_exe()?;
     swap_executable(&exe, &bytes)?;
@@ -324,6 +341,11 @@ mod tests {
         assert!(verify_signature(b"binary", &sig, &pk));
         assert!(!verify_signature(b"evil", &sig, &pk));
         assert!(!verify_signature(b"binary", "zz", &pk));
+        let m = signed_message("v1.2.0", "x86_64-unknown-linux-musl", &"A".repeat(64));
+        let sig2 = hex(kp.sign(m.as_bytes()).as_ref());
+        assert!(verify_signature(m.as_bytes(), &sig2, &pk));
+        let other = signed_message("1.1.0", "x86_64-unknown-linux-musl", &"a".repeat(64));
+        assert!(!verify_signature(other.as_bytes(), &sig2, &pk));
         assert!(url_allowed(
             "https://github.com/OppervisionTech/dodo-agent-releases/releases/download/v1/a"
         ));
