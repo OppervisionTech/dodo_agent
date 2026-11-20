@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-16
+
+### Fixed
+- Batches are sent in chunks under 3 MB, so the ingestor no longer rejects large log batches (#37).
+- A failed batch no longer freezes the agent: disk buffering runs off the async workers, writes one file per priority (max ~1 MB) with one fsync, and keeps its size cached (#38).
+- Disk buffer eviction never deletes higher-priority data, no longer spins forever when space is short, and leftover temporary files are removed (#38).
+
 ## [0.1.0] - 2026-03-01
 
 ### Added

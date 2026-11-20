@@ -39,8 +39,12 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /proc:/host/proc:ro \
   -v /sys:/host/sys:ro \
+  -v /etc/machine-id:/etc/machine-id:ro \
+  -v aegis-agent-data:/var/lib/aegis \
   ghcr.io/oppervisiontech/aegis-agent:latest
 ```
+
+Os dois últimos volumes mantêm a identidade do host entre recriações do container. Sem eles, cada `docker run` novo aparece como um host diferente. Se a máquina não tiver `/etc/machine-id`, fixe a identidade com `-e DODO_HOST_ID=nome-unico-do-host` (1–128 caracteres de `A-Z a-z 0-9 . _ -`, único dentro da organização).
 
 ### Kubernetes
 

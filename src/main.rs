@@ -3,10 +3,58 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+mod health;
+mod updater;
+
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What the command line asks for. The agent takes no options besides these;
+/// everything else comes from the config file (AEGIS_CONFIG).
+#[derive(Debug, PartialEq)]
+enum CliAction {
+    Run,
+    Version,
+    Help,
+    Unknown(String),
+}
+
+fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> CliAction {
+    match args.into_iter().nth(1).as_deref() {
+        None => CliAction::Run,
+        Some("--version" | "-V") => CliAction::Version,
+        Some("--help" | "-h") => CliAction::Help,
+        Some(other) => CliAction::Unknown(other.to_string()),
+    }
+}
+
+fn usage() -> String {
+    format!(
+        "aegis-agent {AGENT_VERSION} ({variant})\n\n\
+         Usage: aegis-agent [--version | --help]\n\n\
+         Configuration is read from $AEGIS_CONFIG (default /etc/aegis/agent.yaml).\n\
+         The API key for certificate enrollment is read from $DODO_API_KEY.\n",
+        variant = agent_variant()
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    match parse_cli(std::env::args()) {
+        CliAction::Run => {}
+        CliAction::Version => {
+            println!("aegis-agent {AGENT_VERSION} ({})", agent_variant());
+            return Ok(());
+        }
+        CliAction::Help => {
+            print!("{}", usage());
+            return Ok(());
+        }
+        CliAction::Unknown(arg) => {
+            eprintln!("aegis-agent: unknown argument '{arg}'\n\n{}", usage());
+            std::process::exit(2);
+        }
+    }
+
     // Determine variant at compile time
     let variant = agent_variant();
 
@@ -80,6 +128,16 @@ async fn main() -> Result<()> {
 
     // Create cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
+
+    // Health probes: /healthz from now on, /readyz once startup completes.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if config.health.enabled {
+        tokio::spawn(health::serve(
+            config.health.listen.clone(),
+            ready.clone(),
+            cancel_token.clone(),
+        ));
+    }
 
     // Build collector registry
     let platform_arc: Arc<dyn agent_platform::Platform> = Arc::from(platform);
@@ -184,6 +242,9 @@ async fn main() -> Result<()> {
         .await?;
     }
 
+    // Enrollment attempted and pipeline about to start: report ready.
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
+
     // Spawn batch consumer (transport layer)
     let transport_config = agent_transport::TransportConfig {
         endpoint_address: config.endpoint.address.clone(),
@@ -236,6 +297,15 @@ async fn main() -> Result<()> {
     let mut cmd_transport_config = transport_config.clone();
     cmd_transport_config.timeout_ms = 0;
     let cmd_agent_id = agent_state.agent_id.clone();
+    // Self-update (binary installs only; DODO_UPDATE_URL opts in).
+    if let Some(update_cfg) = updater::UpdaterConfig::from_env() {
+        tokio::spawn(updater::run(
+            update_cfg,
+            AGENT_VERSION,
+            cancel_token.clone(),
+        ));
+    }
+
     let cmd_cancel = cancel_token.clone();
     let command_channel_handle = tokio::spawn(async move {
         let channel = agent_command::CommandChannel::new(cmd_agent_id, cmd_transport_config);
@@ -636,6 +706,26 @@ async fn run_token_refresh(
     }
 }
 
+/// Write a failed batch to the disk buffer off the async workers.
+async fn buffer_write(
+    buffer: &Arc<agent_transport::buffer::DiskBuffer>,
+    batch: Vec<agent_core::Envelope>,
+    agent_state: &agent_core::AgentState,
+) -> agent_transport::TransportResult<usize> {
+    let writer = Arc::clone(buffer);
+    let written = tokio::task::spawn_blocking(move || writer.write(&batch))
+        .await
+        .unwrap_or_else(|e| {
+            Err(agent_transport::TransportError::Buffer(format!(
+                "buffer task failed: {e}"
+            )))
+        })?;
+    agent_state
+        .buffer_used_bytes
+        .store(buffer.used_bytes(), std::sync::atomic::Ordering::Relaxed);
+    Ok(written)
+}
+
 async fn run_transport(
     batch_rx: &mut tokio::sync::mpsc::Receiver<Vec<agent_core::Envelope>>,
     transport_config: agent_transport::TransportConfig,
@@ -646,8 +736,10 @@ async fn run_transport(
     let grpc_client = agent_transport::grpc_client::GrpcClient::new(transport_config);
 
     // Initialize disk buffer (for offline resilience)
+    // File I/O (fsync) runs on the blocking pool: on the async worker it froze
+    // the transport loop, then the batcher and collectors behind it.
     let disk_buffer = match agent_transport::buffer::DiskBuffer::new(&buffer_config) {
-        Ok(buf) => Some(buf),
+        Ok(buf) => Some(Arc::new(buf)),
         Err(e) => {
             warn!(error = %e, "failed to initialize disk buffer");
             None
@@ -682,13 +774,8 @@ async fn run_transport(
                             agent_state.envelopes_failed.fetch_add(batch_size as u64, std::sync::atomic::Ordering::Relaxed);
                             // Buffer to disk if available
                             if let Some(ref buf) = disk_buffer {
-                                if let Err(be) = buf.write(&batch) {
+                                if let Err(be) = buffer_write(buf, batch, &agent_state).await {
                                     error!(error = %be, "failed to write to disk buffer during shutdown");
-                                } else {
-                                    agent_state.buffer_used_bytes.store(
-                                        buf.used_bytes(),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
                                 }
                             }
                         }
@@ -700,12 +787,20 @@ async fn run_transport(
             }
             _ = disk_retry.tick() => {
                 if let Some(ref buffer) = disk_buffer {
-                    match buffer.peek(500) {
+                    let reader = Arc::clone(buffer);
+                    let peeked = tokio::task::spawn_blocking(move || reader.peek(500))
+                        .await
+                        .unwrap_or_else(|e| Err(agent_transport::TransportError::Buffer(format!("buffer task failed: {e}"))));
+                    match peeked {
                         Ok(pending) if !pending.envelopes.is_empty() => {
                             match grpc_client.submit_batch(pending.envelopes.clone(), &agent_state).await {
                                 Ok(result) => {
                                     record_delivery(&agent_state, &result);
-                                    if let Err(error) = buffer.acknowledge(&pending) { warn!(error=%error,"disk acknowledgement failed; records remain replayable"); }
+                                    let acker = Arc::clone(buffer);
+                                    let acked = tokio::task::spawn_blocking(move || acker.acknowledge(&pending))
+                                        .await
+                                        .unwrap_or_else(|e| Err(agent_transport::TransportError::Buffer(format!("buffer task failed: {e}"))));
+                                    if let Err(error) = acked { warn!(error=%error,"disk acknowledgement failed; records remain replayable"); }
                                     agent_state.buffer_used_bytes.store(buffer.used_bytes(),std::sync::atomic::Ordering::Relaxed);
                                 }
                                 Err(error) => warn!(error=%error,"disk replay failed; retaining unacknowledged records"),
@@ -730,13 +825,8 @@ async fn run_transport(
                         );
                         // Buffer to disk
                         if let Some(ref buf) = disk_buffer {
-                            if let Err(be) = buf.write(&batch) {
+                            if let Err(be) = buffer_write(buf, batch, &agent_state).await {
                                 error!(error = %be, "failed to write to disk buffer");
-                            } else {
-                                agent_state.buffer_used_bytes.store(
-                                    buf.used_bytes(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
                             }
                         }
                     }
@@ -746,6 +836,38 @@ async fn run_transport(
     }
 }
 
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_args_runs_the_agent() {
+        assert_eq!(parse_cli(args(&["aegis-agent"])), CliAction::Run);
+    }
+
+    #[test]
+    fn version_and_help_flags() {
+        assert_eq!(
+            parse_cli(args(&["aegis-agent", "--version"])),
+            CliAction::Version
+        );
+        assert_eq!(parse_cli(args(&["aegis-agent", "-V"])), CliAction::Version);
+        assert_eq!(parse_cli(args(&["aegis-agent", "--help"])), CliAction::Help);
+        assert_eq!(parse_cli(args(&["aegis-agent", "-h"])), CliAction::Help);
+    }
+
+    #[test]
+    fn unknown_argument_is_rejected() {
+        assert_eq!(
+            parse_cli(args(&["aegis-agent", "--mode"])),
+            CliAction::Unknown("--mode".to_string())
+        );
+    }
+}
 fn record_delivery(state: &agent_core::AgentState, result: &agent_transport::SubmitResult) {
     state
         .envelopes_sent

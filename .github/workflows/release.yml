@@ -19,6 +19,8 @@ jobs:
     name: Build ${{ matrix.variant }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
+      # One broken variant must not cancel the others.
+      fail-fast: false
       matrix:
         include:
           - variant: linux
@@ -171,7 +173,9 @@ jobs:
       - uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # amd64 only, like agent-cd-local: the arm64 build under QEMU fails
+          # compiling ring for musl.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -192,7 +196,9 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, docker, verify-public-image]
+    # Binaries only: a broken image build must not block the downloads that
+    # get.sh depends on.
+    needs: [build-binaries]
     steps:
       - uses: actions/checkout@v4
 
@@ -217,13 +223,17 @@ jobs:
       - name: Copy install script
         run: |
           cp get.sh release/get.sh
-          cp get.sh release/install.sh
-          cmp get.sh scripts/install.sh
+          cp scripts/install.sh release/install.sh
           (cd release && sha256sum get.sh > get.sh.sha256 && sha256sum install.sh > install.sh.sha256)
           cat release/get.sh.sha256 release/install.sh.sha256 >> release/checksums.sha256
 
+      # Binaries go to the public releases repo: dodo_agent is private, so its
+      # own release assets are not downloadable by customers. get.sh reads
+      # from OppervisionTech/dodo-agent-releases.
       - uses: softprops/action-gh-release@v2
         with:
+          repository: OppervisionTech/dodo-agent-releases
+          token: ${{ secrets.RELEASES_TOKEN }}
           files: release/*
           body: |
             ## Platform Support
@@ -240,9 +250,7 @@ jobs:
 
             **Linux:**
             ```bash
-            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/get.sh -o get.sh
-            # Set DODO_API_KEY and the environment endpoints from the installation manifest.
-            sudo -E bash get.sh --version ${{ github.ref_name }} --endpoint "$DODO_ENDPOINT" --enrollment-endpoint "$DODO_ENROLLMENT_ENDPOINT"
+            curl -fsSL https://dodo.oppervision.com.br/agent | sudo DODO_API_KEY="$DODO_API_KEY" bash -s -- --mode server
             ```
 
             **Docker:**
@@ -260,4 +268,44 @@ jobs:
             ```
 
             ## What's Changed
-            See [CHANGELOG.md](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md)
+            See the changelog at https://dodo.oppervision.com.br/pt/changelog/
+
+  # After the image is public, open the chart bump PR in dodo_helm_charts.
+  # Merging it publishes the chart (helm-publish runs on charts/aegis-agent/**).
+  # Needs CHARTS_PR_TOKEN: a fine-grained token with contents and
+  # pull-requests write on dodo_helm_charts. Without it the job only warns.
+  chart-bump:
+    name: Open chart bump PR
+    runs-on: ubuntu-latest
+    needs: [verify-public-image, release]
+    if: ${{ !contains(github.ref_name, '-') }} # skip pre-releases (v1.2.3-rc1)
+    env:
+      GH_TOKEN: ${{ secrets.CHARTS_PR_TOKEN }}
+      CHARTS_REPO: OppervisionTech/dodo_helm_charts
+    steps:
+      - name: Bump aegis-agent chart and open PR
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::CHARTS_PR_TOKEN not set; bump the aegis-agent chart by hand"
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          branch="chore/aegis-agent-${version}"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${CHARTS_REPO}.git" charts
+          cd charts
+          chart=charts/aegis-agent/Chart.yaml
+          if grep -q "^appVersion: \"${version}\"" "$chart"; then
+            echo "chart already at appVersion ${version}"
+            exit 0
+          fi
+          sed -i "s/^version: .*/version: ${version}/; s/^appVersion: .*/appVersion: \"${version}\"/" "$chart"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "chore(aegis-agent): chart ${version} (agent ${GITHUB_REF_NAME})"
+          git push --force origin "$branch"
+          gh pr view "$branch" -R "$CHARTS_REPO" >/dev/null 2>&1 || gh pr create -R "$CHARTS_REPO" \
+            --base main --head "$branch" \
+            --title "chore(aegis-agent): chart ${version}" \
+            --body "Automated: agent ${GITHUB_REF_NAME} image is published and verified. Bumps chart \`version\` and \`appVersion\` to ${version}. Merging publishes the chart."

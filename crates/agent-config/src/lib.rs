@@ -43,10 +43,47 @@ pub struct LocalAgentConfig {
     /// Set to empty string to disable enrollment (manual cert management).
     #[serde(default = "default_enrollment_endpoint")]
     pub enrollment_endpoint: String,
+    /// Liveness/readiness HTTP endpoint (/healthz, /readyz).
+    #[serde(default)]
+    pub health: HealthLocalConfig,
 }
 
+/// Health probe server. Loopback by default; the Helm chart sets
+/// `0.0.0.0:9090` so the kubelet can reach it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HealthLocalConfig {
+    #[serde(default = "default_health_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_health_listen")]
+    pub listen: String,
+}
+
+fn default_health_enabled() -> bool {
+    true
+}
+
+fn default_health_listen() -> String {
+    "127.0.0.1:9090".to_string()
+}
+
+impl Default for HealthLocalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_enabled(),
+            listen: default_health_listen(),
+        }
+    }
+}
+
+/// Last-resort fallback only — not environment-aware. `get.sh` and the
+/// `aegis-agent` Helm chart always write an explicit `enrollment_endpoint`
+/// key into the generated config (deriving it per environment, since gRPC
+/// ingest and HTTPS enrollment are not guaranteed to share a hostname
+/// outside of production — see `derive_enrollment_endpoint()` in get.sh).
+/// This default only matters for hand-written configs that omit the key
+/// entirely, and always points at production.
 fn default_enrollment_endpoint() -> String {
-    String::new()
+    "https://api.stg.dodo.oppervision.com.br/v1/enroll".to_string()
 }
 
 fn default_endpoint() -> EndpointLocalConfig {
@@ -74,6 +111,7 @@ impl Default for LocalAgentConfig {
             config_pull_interval_seconds: 60,
             agent_id_path: default_agent_id_path(),
             enrollment_endpoint: default_enrollment_endpoint(),
+            health: HealthLocalConfig::default(),
         }
     }
 }
@@ -91,10 +129,10 @@ pub struct EndpointLocalConfig {
 }
 
 fn default_address() -> String {
-    "127.0.0.1:50051".to_string()
+    "grpc.stg.dodo.oppervision.com.br:443".to_string()
 }
 fn default_timeout_ms() -> u32 {
-    5000
+    15000
 }
 fn default_retry_max() -> u32 {
     3
@@ -176,7 +214,7 @@ fn default_flush_interval_ms() -> u32 {
     5000
 }
 fn default_max_batch_size() -> u32 {
-    500
+    200
 }
 
 impl Default for BufferLocalConfig {

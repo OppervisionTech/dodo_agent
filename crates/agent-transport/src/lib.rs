@@ -104,7 +104,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             endpoint_address: "localhost:443".to_string(),
-            timeout_ms: 5000,
+            timeout_ms: 15000,
             retry_max: 3,
             retry_backoff_ms: 1000,
             tls_enabled: true,

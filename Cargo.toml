@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.5"
 edition = "2021"
 rust-version = "1.75"
 license = "Proprietary"
@@ -147,6 +147,9 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+reqwest = { workspace = true }
+ring = "0.17"
 
 [[bin]]
 name = "aegis-agent"

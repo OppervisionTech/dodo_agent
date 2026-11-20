@@ -1,7 +1,7 @@
 //! Batcher — accumulates envelopes and flushes in batches.
 //!
 //! Implements HU014 (batching). Flushes when any of these conditions is met:
-//! - Envelope count reaches `max_batch_size` (default 500)
+//! - Envelope count reaches `max_batch_size` (default 200)
 //! - Timer expires (`flush_interval_ms`, default 5000ms)
 //! - Shutdown signal (cancellation token)
 
@@ -26,7 +26,7 @@ impl Default for BatcherConfig {
     fn default() -> Self {
         Self {
             flush_interval_ms: 5_000,
-            max_batch_size: 500,
+            max_batch_size: 200,
         }
     }
 }
@@ -77,6 +77,13 @@ pub async fn run(
 
             // Priority 1: shutdown.
             () = cancel_token.cancelled() => {
+                // Drain envelopes already queued so they are not lost on shutdown.
+                while let Ok(envelope) = envelope_rx.try_recv() {
+                    buffer.push(envelope);
+                    if buffer.len() >= max_batch {
+                        flush(&batch_tx, &mut buffer).await?;
+                    }
+                }
                 tracing::info!(
                     remaining = buffer.len(),
                     "batcher shutting down, flushing remaining envelopes"
