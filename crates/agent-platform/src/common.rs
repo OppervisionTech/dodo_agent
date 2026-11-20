@@ -61,11 +61,42 @@ pub fn resolve_machine_id(fallback_path: &str) -> PlatformResult<String> {
     )
 }
 
+/// Environment variable that pins the host identity. For containers that
+/// see neither the host's `/etc/machine-id` nor a persistent state
+/// directory: without it every container recreate generates a new identity
+/// and the same machine shows up as a new host each time.
+pub const HOST_ID_ENV: &str = "DODO_HOST_ID";
+
+/// A usable operator-provided host id: 1–128 characters of `[A-Za-z0-9._-]`.
+/// Anything else is ignored (never trusted as an identity) rather than
+/// failing startup over a typo.
+pub(crate) fn host_id_override(value: Option<&str>) -> Option<String> {
+    let id = value?.trim();
+    let valid = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !valid {
+        if !id.is_empty() {
+            tracing::warn!(
+                env = HOST_ID_ENV,
+                "ignoring invalid host id override (allowed: 1-128 chars of [A-Za-z0-9._-])"
+            );
+        }
+        return None;
+    }
+    Some(id.to_string())
+}
+
 pub(crate) fn resolve_machine_id_from_paths(
     paths: [std::path::PathBuf; 2],
     fallback_path: &str,
     legacy_path: Option<&std::path::Path>,
 ) -> PlatformResult<String> {
+    if let Some(id) = host_id_override(std::env::var(HOST_ID_ENV).ok().as_deref()) {
+        return Ok(id);
+    }
     for path in paths {
         if let Some(id) = read_identity(&path) {
             return Ok(id);
@@ -132,6 +163,12 @@ fn read_or_generate_persisted(path: &str, legacy: Option<String>) -> PlatformRes
     };
     file.write_all(id.as_bytes())?;
     file.sync_all()?;
+    // A generated identity lives only as long as this file. In a container
+    // without a volume here, the next recreate is a "new host".
+    tracing::warn!(
+        path = path,
+        "no machine-id found: generated a host identity; persist this path (volume) or set DODO_HOST_ID so this host keeps one identity across reinstalls"
+    );
     Ok(id)
 }
 
@@ -361,6 +398,28 @@ impl Platform for MockPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_id_override_accepts_only_safe_identifiers() {
+        assert_eq!(
+            host_id_override(Some("node-1.prod_a")),
+            Some("node-1.prod_a".to_string())
+        );
+        assert_eq!(
+            host_id_override(Some("  web-01 \n")),
+            Some("web-01".to_string())
+        );
+        assert_eq!(host_id_override(None), None);
+        assert_eq!(host_id_override(Some("")), None);
+        assert_eq!(host_id_override(Some("   ")), None);
+        assert_eq!(host_id_override(Some("has space")), None);
+        assert_eq!(host_id_override(Some("a/b")), None);
+        assert_eq!(host_id_override(Some(&"x".repeat(129))), None);
+        assert_eq!(
+            host_id_override(Some(&"x".repeat(128))),
+            Some("x".repeat(128))
+        );
+    }
 
     /// Two independent calls against a fresh path (simulating a host with
     /// neither /etc/machine-id nor /var/lib/dbus/machine-id, exercised

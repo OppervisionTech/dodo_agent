@@ -96,7 +96,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: llvm line accounting shifts between rustc releases and moved
+      # the 80% gate by ~2.5 points with no code change (1.99.1 -> 1.100.0).
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
 

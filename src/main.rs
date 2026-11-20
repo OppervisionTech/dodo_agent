@@ -4,6 +4,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 mod health;
+mod updater;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -296,6 +297,15 @@ async fn main() -> Result<()> {
     let mut cmd_transport_config = transport_config.clone();
     cmd_transport_config.timeout_ms = 0;
     let cmd_agent_id = agent_state.agent_id.clone();
+    // Self-update (binary installs only; DODO_UPDATE_URL opts in).
+    if let Some(update_cfg) = updater::UpdaterConfig::from_env() {
+        tokio::spawn(updater::run(
+            update_cfg,
+            AGENT_VERSION,
+            cancel_token.clone(),
+        ));
+    }
+
     let cmd_cancel = cancel_token.clone();
     let command_channel_handle = tokio::spawn(async move {
         let channel = agent_command::CommandChannel::new(cmd_agent_id, cmd_transport_config);
@@ -696,6 +706,26 @@ async fn run_token_refresh(
     }
 }
 
+/// Write a failed batch to the disk buffer off the async workers.
+async fn buffer_write(
+    buffer: &Arc<agent_transport::buffer::DiskBuffer>,
+    batch: Vec<agent_core::Envelope>,
+    agent_state: &agent_core::AgentState,
+) -> agent_transport::TransportResult<usize> {
+    let writer = Arc::clone(buffer);
+    let written = tokio::task::spawn_blocking(move || writer.write(&batch))
+        .await
+        .unwrap_or_else(|e| {
+            Err(agent_transport::TransportError::Buffer(format!(
+                "buffer task failed: {e}"
+            )))
+        })?;
+    agent_state
+        .buffer_used_bytes
+        .store(buffer.used_bytes(), std::sync::atomic::Ordering::Relaxed);
+    Ok(written)
+}
+
 async fn run_transport(
     batch_rx: &mut tokio::sync::mpsc::Receiver<Vec<agent_core::Envelope>>,
     transport_config: agent_transport::TransportConfig,
@@ -706,8 +736,10 @@ async fn run_transport(
     let grpc_client = agent_transport::grpc_client::GrpcClient::new(transport_config);
 
     // Initialize disk buffer (for offline resilience)
+    // File I/O (fsync) runs on the blocking pool: on the async worker it froze
+    // the transport loop, then the batcher and collectors behind it.
     let disk_buffer = match agent_transport::buffer::DiskBuffer::new(&buffer_config) {
-        Ok(buf) => Some(buf),
+        Ok(buf) => Some(Arc::new(buf)),
         Err(e) => {
             warn!(error = %e, "failed to initialize disk buffer");
             None
@@ -742,13 +774,8 @@ async fn run_transport(
                             agent_state.envelopes_failed.fetch_add(batch_size as u64, std::sync::atomic::Ordering::Relaxed);
                             // Buffer to disk if available
                             if let Some(ref buf) = disk_buffer {
-                                if let Err(be) = buf.write(&batch) {
+                                if let Err(be) = buffer_write(buf, batch, &agent_state).await {
                                     error!(error = %be, "failed to write to disk buffer during shutdown");
-                                } else {
-                                    agent_state.buffer_used_bytes.store(
-                                        buf.used_bytes(),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
                                 }
                             }
                         }
@@ -760,12 +787,20 @@ async fn run_transport(
             }
             _ = disk_retry.tick() => {
                 if let Some(ref buffer) = disk_buffer {
-                    match buffer.peek(500) {
+                    let reader = Arc::clone(buffer);
+                    let peeked = tokio::task::spawn_blocking(move || reader.peek(500))
+                        .await
+                        .unwrap_or_else(|e| Err(agent_transport::TransportError::Buffer(format!("buffer task failed: {e}"))));
+                    match peeked {
                         Ok(pending) if !pending.envelopes.is_empty() => {
                             match grpc_client.submit_batch(pending.envelopes.clone(), &agent_state).await {
                                 Ok(result) => {
                                     record_delivery(&agent_state, &result);
-                                    if let Err(error) = buffer.acknowledge(&pending) { warn!(error=%error,"disk acknowledgement failed; records remain replayable"); }
+                                    let acker = Arc::clone(buffer);
+                                    let acked = tokio::task::spawn_blocking(move || acker.acknowledge(&pending))
+                                        .await
+                                        .unwrap_or_else(|e| Err(agent_transport::TransportError::Buffer(format!("buffer task failed: {e}"))));
+                                    if let Err(error) = acked { warn!(error=%error,"disk acknowledgement failed; records remain replayable"); }
                                     agent_state.buffer_used_bytes.store(buffer.used_bytes(),std::sync::atomic::Ordering::Relaxed);
                                 }
                                 Err(error) => warn!(error=%error,"disk replay failed; retaining unacknowledged records"),
@@ -790,13 +825,8 @@ async fn run_transport(
                         );
                         // Buffer to disk
                         if let Some(ref buf) = disk_buffer {
-                            if let Err(be) = buf.write(&batch) {
+                            if let Err(be) = buffer_write(buf, batch, &agent_state).await {
                                 error!(error = %be, "failed to write to disk buffer");
-                            } else {
-                                agent_state.buffer_used_bytes.store(
-                                    buf.used_bytes(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
                             }
                         }
                     }
