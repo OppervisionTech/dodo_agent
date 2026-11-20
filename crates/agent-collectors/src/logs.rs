@@ -269,10 +269,14 @@ impl LogsCollector {
         }
         // First level-looking word among the leading tokens ("[notice]",
         // "INFO:", "2026/11/20 14:07:15 [error]", "WARNING ...").
+        // URLs, paths and key=value words never carry the level (an httpx
+        // "HTTP Request: POST http://h/?param_not_error_re=..." is INFO).
         for tok in body
-            .split(|c: char| !c.is_ascii_alphabetic())
+            .split_whitespace()
+            .take(10)
+            .filter(|w| !w.contains(['/', '=', '?', '&']))
+            .flat_map(|w| w.split(|c: char| !c.is_ascii_alphabetic()))
             .filter(|t| !t.is_empty())
-            .take(12)
         {
             match tok.to_ascii_uppercase().as_str() {
                 "TRACE" => return "TRACE",
@@ -291,7 +295,9 @@ impl LogsCollector {
         } else if upper.contains("TRACEBACK (MOST RECENT CALL LAST)")
             || upper.contains("EXCEPTION")
             || upper
-                .split(|c: char| !c.is_ascii_alphabetic())
+                .split_whitespace()
+                .filter(|w| !w.contains(['/', '=', '?', '&']))
+                .flat_map(|w| w.split(|c: char| !c.is_ascii_alphabetic()))
                 .any(|w| w.ends_with("ERROR") || w.ends_with("EXCEPTION"))
         {
             "ERROR"
@@ -521,6 +527,8 @@ mod tests {
             ("2026-11-20T14:11:11.479806992Z stderr F E1120 14:10:39.5 1 x.go:1] sync failed", "ERROR"),
             ("2026-11-20T14:11:11.479806992Z stderr F Traceback (most recent call last):", "ERROR"),
             ("time=1 level=error msg=boom", "ERROR"),
+            ("2026-11-20T20:30:00.1Z stderr F HTTP Request: POST http://ch:8123/?database=dodo_logs&param_not_error_re=x \"HTTP/1.1 200 OK\"", "INFO"),
+            ("2026-11-20T20:30:00.1Z stderr F GET /api/errors/list 200", "INFO"),
             ("2026/11/20 [error] 12#0: upstream timed out", "ERROR"),
         ];
         for (line, want) in cases {
