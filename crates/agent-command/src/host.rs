@@ -106,8 +106,10 @@ async fn submit_to_runner(spec: &Value, socket: &str) -> Result<String, CommandE
     let runner_user = std::env::var("DODO_SCRIPT_USER").unwrap_or_else(|_| "dodo-script".into());
     let expected = uid_of(&runner_user)
         .ok_or_else(|| exec_err(format!("script user {runner_user:?} not found")))?;
+    // Under socket activation the peer credentials are those of whoever
+    // called listen(): systemd (root). Accept root or the runner itself.
     let peer = stream.peer_cred().map(|c| c.uid()).ok();
-    if peer != Some(expected) {
+    if !matches!(peer, Some(0)) && peer != Some(expected) {
         return Err(exec_err(
             "script runner socket is not owned by the script user; refused",
         ));
@@ -164,6 +166,11 @@ fn listener_from_systemd(socket: &str) -> Result<tokio::net::UnixListener, Strin
     if ours && std::env::var("LISTEN_FDS").as_deref() == Ok("1") {
         // SAFETY: systemd passes the listening socket as fd 3 (SD_LISTEN_FDS_START).
         let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
+        // Never let a script inherit the listening socket.
+        // SAFETY: fcntl on a valid fd we own.
+        if unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err("could not set FD_CLOEXEC on the runner socket".into());
+        }
         std_listener
             .set_nonblocking(true)
             .map_err(|e| format!("socket fd: {e}"))?;
@@ -268,9 +275,11 @@ fn drop_privileges_in_child() -> std::io::Result<()> {
         inheritable: u32,
     }
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-    // SAFETY: plain prctl/capset syscalls on the current (child) process with
-    // valid, stack-owned arguments.
+    // SAFETY: plain prctl/capset/close_range syscalls on the current (child)
+    // process with valid, stack-owned arguments.
     unsafe {
+        // Close every inherited fd above stderr (sockets, pipes, files).
+        libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(std::io::Error::last_os_error());
         }
