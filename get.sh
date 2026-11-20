@@ -704,11 +704,27 @@ _write_agent_env() {
 # and only accepts the agent's uid (SO_PEERCRED).
 _write_script_runner_unit() {
   local script_user="${DODO_SCRIPT_USER:-dodo-script}"
+  # Socket owned by root in root-owned /run: the script user can neither
+  # replace it nor connect; only the agent's group can.
+  cat > /etc/systemd/system/dodo-script-runner.socket << UNIT
+[Unit]
+Description=DoDo workflow script runner socket
+
+[Socket]
+ListenStream=/run/dodo-script.sock
+SocketUser=root
+SocketGroup=${SERVICE_USER}
+SocketMode=0660
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
+UNIT
   cat > /etc/systemd/system/dodo-script-runner.service << UNIT
 [Unit]
 Description=DoDo workflow script runner (runs scripts sent by aegis-agent)
-After=network-online.target
-Before=aegis-agent.service
+Requires=dodo-script-runner.socket
+After=network-online.target dodo-script-runner.socket
 
 [Service]
 Type=simple
@@ -716,8 +732,6 @@ User=${script_user}
 Group=${script_user}
 ExecStart=/usr/local/bin/aegis-agent --script-runner
 Environment=DODO_SCRIPT_CLIENT_USER=${SERVICE_USER}
-RuntimeDirectory=dodo-script
-RuntimeDirectoryMode=0755
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
@@ -731,10 +745,10 @@ UMask=0077
 WantedBy=multi-user.target
 UNIT
   # The agent (ProtectSystem=strict) must reach the runner's socket.
-  sed -i 's|^ReadWritePaths=/var/lib/aegis /var/log/aegis$|ReadWritePaths=/var/lib/aegis /var/log/aegis -/run/dodo-script|' \
+  sed -i 's|^ReadWritePaths=/var/lib/aegis /var/log/aegis$|ReadWritePaths=/var/lib/aegis /var/log/aegis -/run/dodo-script.sock|' \
     /etc/systemd/system/aegis-agent.service
   systemctl daemon-reload
-  systemctl enable --now dodo-script-runner
+  systemctl enable --now dodo-script-runner.socket dodo-script-runner.service
   ok "Script runner enabled (dodo-script-runner, user ${script_user})"
 }
 

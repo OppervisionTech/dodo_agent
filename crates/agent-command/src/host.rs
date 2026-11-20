@@ -79,7 +79,10 @@ fn clip(mut s: String) -> String {
     s
 }
 
-pub const DEFAULT_SCRIPT_SOCKET: &str = "/run/dodo-script/script.sock";
+/// Created by systemd (dodo-script-runner.socket): owned by root, group
+/// aegis-agent, mode 0660, in root-owned /run, so the script user can
+/// neither replace it nor connect to it.
+pub const DEFAULT_SCRIPT_SOCKET: &str = "/run/dodo-script.sock";
 const MAX_REQUEST: usize = 1024 * 1024;
 
 fn script_socket() -> String {
@@ -99,13 +102,26 @@ async fn submit_to_runner(spec: &Value, socket: &str) -> Result<String, CommandE
             "script runner not reachable at {socket}: {e} (install with --allow-scripts)"
         ))
     })?;
+    // Only hand scripts (and their env/secrets) to the real runner.
+    let runner_user = std::env::var("DODO_SCRIPT_USER").unwrap_or_else(|_| "dodo-script".into());
+    let expected = uid_of(&runner_user)
+        .ok_or_else(|| exec_err(format!("script user {runner_user:?} not found")))?;
+    let peer = stream.peer_cred().map(|c| c.uid()).ok();
+    if peer != Some(expected) {
+        return Err(exec_err(
+            "script runner socket is not owned by the script user; refused",
+        ));
+    }
     let mut line = serde_json::to_vec(spec).map_err(|e| exec_err(e.to_string()))?;
     line.push(b'\n');
     stream
         .write_all(&line)
         .await
         .map_err(|e| exec_err(format!("send to script runner: {e}")))?;
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(tokio::io::AsyncReadExt::take(
+        stream,
+        (MAX_OUTPUT + 4096) as u64,
+    ));
     let mut reply = String::new();
     tokio::time::timeout(
         Duration::from_secs(timeout_s + 30),
@@ -137,10 +153,35 @@ fn uid_of(user: &str) -> Option<u32> {
     (!pw.is_null()).then(|| unsafe { (*pw).pw_uid })
 }
 
+/// The socket systemd created for us (LISTEN_FDS); binding our own is only
+/// allowed for development, with DODO_SCRIPT_SOCKET set explicitly.
+fn listener_from_systemd(socket: &str) -> Result<tokio::net::UnixListener, String> {
+    use std::os::unix::io::FromRawFd;
+    let ours = std::env::var("LISTEN_PID")
+        .ok()
+        .and_then(|p| p.parse::<u32>().ok())
+        == Some(std::process::id());
+    if ours && std::env::var("LISTEN_FDS").as_deref() == Ok("1") {
+        // SAFETY: systemd passes the listening socket as fd 3 (SD_LISTEN_FDS_START).
+        let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
+        std_listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("socket fd: {e}"))?;
+        return tokio::net::UnixListener::from_std(std_listener).map_err(|e| e.to_string());
+    }
+    if std::env::var("DODO_SCRIPT_SOCKET").is_err() {
+        return Err(
+            "no systemd socket (dodo-script-runner.socket); DODO_SCRIPT_SOCKET is for development only"
+                .into(),
+        );
+    }
+    let _ = std::fs::remove_file(socket);
+    tokio::net::UnixListener::bind(socket).map_err(|e| format!("bind {socket}: {e}"))
+}
+
 /// `aegis-agent --script-runner`: serve script requests from the agent.
 /// Runs as the unprivileged script user (systemd unit dodo-script-runner).
 pub async fn serve_script_runner() -> anyhow_like::Result {
-    use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     let socket = script_socket();
     let client = std::env::var("DODO_SCRIPT_CLIENT_USER").unwrap_or_else(|_| "aegis-agent".into());
@@ -150,12 +191,7 @@ pub async fn serve_script_runner() -> anyhow_like::Result {
     if me == 0 || me == client_uid {
         return Err("the script runner must run as its own unprivileged user".into());
     }
-    let _ = std::fs::remove_file(&socket);
-    let listener =
-        tokio::net::UnixListener::bind(&socket).map_err(|e| format!("bind {socket}: {e}"))?;
-    // Who may connect is decided by SO_PEERCRED below, not file mode.
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
-        .map_err(|e| format!("chmod {socket}: {e}"))?;
+    let listener = listener_from_systemd(&socket)?;
     tracing::info!(socket, client, "script runner listening");
     loop {
         let (stream, _) = listener
