@@ -125,6 +125,8 @@ pub struct KubernetesCollector {
     /// key → last seen state; None until the first scan primed it (the
     /// first scan never emits: an agent restart is not a rollout).
     workloads: Mutex<Option<HashMap<String, WorkloadState>>>,
+    /// Pods and container restart counts seen in the last scan of this node.
+    pods: Mutex<Option<PodLifecycle>>,
     ticks: AtomicU64,
 }
 
@@ -165,6 +167,7 @@ impl KubernetesCollector {
             node_name,
             api,
             workloads: Mutex::new(None),
+            pods: Mutex::new(None),
             ticks: AtomicU64::new(0),
         }
     }
@@ -244,6 +247,13 @@ impl KubernetesCollector {
             node,
             &instance_type,
         ));
+        let mut guard = match self.pods.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let primed = guard.is_some();
+        let state = guard.get_or_insert_with(PodLifecycle::default);
+        out.extend(state.scan(&pods, node, primed));
         out
     }
 }
@@ -416,6 +426,189 @@ fn rollout_envelope(w: &WorkloadSnapshot, previous: Option<&WorkloadState>) -> E
             "previous_version": if previous_image.is_empty() { String::new() } else { image_version(&previous_image) },
         }),
     )
+}
+
+/// A pod as remembered between scans.
+#[derive(Debug, Clone)]
+struct SeenPod {
+    namespace: String,
+    name: String,
+    workload: String,
+    workload_kind: String,
+}
+
+/// Pod lifecycle on this node between scans: container restarts (OOMKilled,
+/// crashes) and pods that went away (killed, evicted, deleted). Each change
+/// becomes a log line and per-scan metrics the backend alerts on.
+#[derive(Debug, Default)]
+pub(crate) struct PodLifecycle {
+    /// pod uid → pod
+    pods: HashMap<String, SeenPod>,
+    /// (namespace, pod, container) → restartCount
+    restarts: HashMap<(String, String, String), u64>,
+}
+
+impl PodLifecycle {
+    /// Compare this scan with the last one. `primed` is false on the first
+    /// scan, which only records state (an agent restart is not an event).
+    pub(crate) fn scan(&mut self, pods: &Value, node: &str, primed: bool) -> Vec<Envelope> {
+        let mut out = Vec::new();
+        let mut seen: HashMap<String, SeenPod> = HashMap::new();
+        let mut restarts: HashMap<(String, String, String), u64> = HashMap::new();
+        for pod in pods
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let str_at = |p: &str| pod.pointer(p).and_then(Value::as_str).unwrap_or("");
+            let (uid, ns, name) = (
+                str_at("/metadata/uid"),
+                str_at("/metadata/namespace"),
+                str_at("/metadata/name"),
+            );
+            if uid.is_empty() {
+                continue;
+            }
+            let (workload_kind, workload) = pod_workload(pod);
+            let statuses = pod
+                .pointer("/status/containerStatuses")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let ready = !statuses.is_empty()
+                && statuses
+                    .iter()
+                    .all(|c| c.get("ready").and_then(Value::as_bool) == Some(true));
+            out.push(crate::helpers::metric_envelope(
+                "k8s.pod.ready",
+                if ready { 1.0 } else { 0.0 },
+                &[
+                    ("namespace", ns),
+                    ("pod", name),
+                    ("workload", workload.as_str()),
+                    ("workload_kind", workload_kind.as_str()),
+                    ("node", node),
+                ],
+                "gauge",
+            ));
+            for c in &statuses {
+                let cname = c.get("name").and_then(Value::as_str).unwrap_or("");
+                let count = c.get("restartCount").and_then(Value::as_u64).unwrap_or(0);
+                let key = (ns.to_string(), name.to_string(), cname.to_string());
+                let before = self.restarts.get(&key).copied();
+                restarts.insert(key, count);
+                // A pod seen for the first time brings its old restarts: not new.
+                let increase = match before {
+                    Some(b) if primed && count > b => count - b,
+                    _ => 0,
+                };
+                let reason = c
+                    .pointer("/lastState/terminated/reason")
+                    .and_then(Value::as_str)
+                    .or_else(|| c.pointer("/state/waiting/reason").and_then(Value::as_str))
+                    .unwrap_or("");
+                let labels = [
+                    ("namespace", ns),
+                    ("pod", name),
+                    ("container", cname),
+                    ("workload", workload.as_str()),
+                    ("workload_kind", workload_kind.as_str()),
+                    ("node", node),
+                    ("reason", reason),
+                ];
+                out.push(crate::helpers::metric_envelope(
+                    "k8s.container.restarts",
+                    count as f64,
+                    &labels,
+                    "gauge",
+                ));
+                out.push(crate::helpers::metric_envelope(
+                    "k8s.container.restarts.increase",
+                    increase as f64,
+                    &labels,
+                    "gauge",
+                ));
+                if increase > 0 {
+                    let exit = c
+                        .pointer("/lastState/terminated/exitCode")
+                        .and_then(Value::as_i64)
+                        .map(|e| format!(", exit code {e}"))
+                        .unwrap_or_default();
+                    let why = if reason.is_empty() { "unknown" } else { reason };
+                    out.push(crate::helpers::log_envelope(
+                        &format!(
+                            "Container {cname} of pod {ns}/{name} restarted {increase}x ({why}{exit})"
+                        ),
+                        if reason == "OOMKilled" { "ERROR" } else { "WARN" },
+                        "kubernetes",
+                        &labels,
+                        None,
+                        None,
+                    ));
+                }
+            }
+            seen.insert(
+                uid.to_string(),
+                SeenPod {
+                    namespace: ns.to_string(),
+                    name: name.to_string(),
+                    workload,
+                    workload_kind,
+                },
+            );
+        }
+
+        // Pods gone since the last scan, counted per workload.
+        let mut gone: HashMap<(String, String, String), u64> = HashMap::new();
+        if primed {
+            for (uid, p) in &self.pods {
+                if seen.contains_key(uid) {
+                    continue;
+                }
+                *gone
+                    .entry((
+                        p.namespace.clone(),
+                        p.workload.clone(),
+                        p.workload_kind.clone(),
+                    ))
+                    .or_default() += 1;
+                out.push(crate::helpers::log_envelope(
+                    &format!(
+                        "Pod {}/{} of {} {} terminated",
+                        p.namespace, p.name, p.workload_kind, p.workload
+                    ),
+                    "ERROR",
+                    "kubernetes",
+                    &[
+                        ("namespace", p.namespace.as_str()),
+                        ("pod", p.name.as_str()),
+                        ("workload", p.workload.as_str()),
+                        ("workload_kind", p.workload_kind.as_str()),
+                        ("node", node),
+                    ],
+                    None,
+                    None,
+                ));
+            }
+        }
+        for ((ns, workload, kind), n) in &gone {
+            out.push(crate::helpers::metric_envelope(
+                "k8s.workload.pods_terminated",
+                *n as f64,
+                &[
+                    ("namespace", ns.as_str()),
+                    ("workload", workload.as_str()),
+                    ("workload_kind", kind.as_str()),
+                    ("node", node),
+                ],
+                "gauge",
+            ));
+        }
+        self.pods = seen;
+        self.restarts = restarts;
+        out
+    }
 }
 
 /// CPU quantity ("250m", "2", "1.5") in cores.
@@ -765,5 +958,54 @@ mod tests {
             pod_workload(&pods["items"][0]),
             ("Deployment".to_string(), "checkout-api".to_string())
         );
+    }
+
+    fn pod(uid: &str, name: &str, restarts: u64, reason: &str) -> Value {
+        json!({
+            "metadata": {"uid": uid, "namespace": "shop", "name": name,
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "api-5d8f"}]},
+            "status": {"containerStatuses": [{"name": "app", "ready": true,
+                "restartCount": restarts,
+                "lastState": {"terminated": {"reason": reason, "exitCode": 137}}}]}
+        })
+    }
+
+    fn logs(env: &[Envelope]) -> usize {
+        env.iter()
+            .filter(|e| e.signal_type == SignalType::Log)
+            .count()
+    }
+
+    #[test]
+    fn first_scan_only_records_state() {
+        let mut lc = PodLifecycle::default();
+        let out = lc.scan(
+            &json!({"items": [pod("u1", "api-1", 3, "OOMKilled")]}),
+            "n1",
+            false,
+        );
+        assert_eq!(logs(&out), 0);
+    }
+
+    #[test]
+    fn restart_increase_logs_reason() {
+        let mut lc = PodLifecycle::default();
+        lc.scan(&json!({"items": [pod("u1", "api-1", 0, "")]}), "n1", false);
+        let out = lc.scan(
+            &json!({"items": [pod("u1", "api-1", 2, "OOMKilled")]}),
+            "n1",
+            true,
+        );
+        assert_eq!(logs(&out), 1);
+    }
+
+    #[test]
+    fn pod_gone_is_reported() {
+        let mut lc = PodLifecycle::default();
+        lc.scan(&json!({"items": [pod("u1", "api-1", 0, "")]}), "n1", false);
+        let out = lc.scan(&json!({"items": [pod("u2", "api-2", 0, "")]}), "n1", true);
+        // the old pod is gone; the new one is not a restart
+        assert_eq!(logs(&out), 1);
+        assert_eq!(out.len(), 1 + 2 + 1 + 1); // ready, restarts x2, log, terminated
     }
 }
