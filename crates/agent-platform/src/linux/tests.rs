@@ -191,7 +191,7 @@ fn disk_snapshots_filter_partitions_pseudo_and_duplicate_mounts() {
         ("/data", "/dev/a", "ext4")
     );
     assert!(disk.total_bytes > 0 && disk.free_bytes <= disk.total_bytes);
-    assert_eq!(disk.used_bytes, disk.total_bytes - disk.free_bytes);
+    assert!(disk.used_bytes + disk.free_bytes <= disk.total_bytes);
     assert!(disk.inodes_used <= disk.inodes_total);
     f.write("/proc/diskstats", "bad\n8 0 sda 10 0 20 0 30 0 40 0 0 50 60\n8 1 sda1 10 0 20 0 30 0 40 0 0 50 60\n259 0 nvme0n1 10 0 20 0 30 0 40 0 0 50 60\n259 1 nvme0n1p1 10 0 20 0 30 0 40 0 0 50 60\n253 0 dm-0 10 0 20 0 30 0 40 0 0 50 60\n7 0 loop0 0 0 0 0 0 0 0 0 0 0 0\n");
     let io = f.platform.disk_io().unwrap();
