@@ -11,6 +11,8 @@ mod channel;
 mod executor;
 #[cfg(unix)]
 mod host;
+#[cfg(unix)]
+mod remediation;
 
 pub use channel::CommandChannel;
 pub use executor::CommandExecutor;

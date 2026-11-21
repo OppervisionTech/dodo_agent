@@ -332,7 +332,7 @@ fn validate_payload(payload: &AgentCommandPayload) -> Result<(), CommandError> {
     }
 }
 
-fn validate_namespace(namespace: &str) -> Result<(), CommandError> {
+pub(crate) fn validate_namespace(namespace: &str) -> Result<(), CommandError> {
     if valid_dns_label(namespace, 63) {
         Ok(())
     } else {
@@ -340,7 +340,7 @@ fn validate_namespace(namespace: &str) -> Result<(), CommandError> {
     }
 }
 
-fn validate_resource_name(name: &str) -> Result<(), CommandError> {
+pub(crate) fn validate_resource_name(name: &str) -> Result<(), CommandError> {
     // Kubernetes DNS-subdomain names are at most 253 characters. The API's
     // subdomain check bounds the complete name rather than individual labels.
     if name.len() <= 253 && name.split('.').all(|label| valid_dns_label(label, 253)) {
@@ -382,7 +382,7 @@ fn valid_describe_name(value: &str) -> bool {
 
 /// Run a kubectl command with a timeout. Returns stdout on success,
 /// or CommandError with stderr on failure.
-async fn run_kubectl(
+pub(crate) async fn run_kubectl(
     program: &std::path::Path,
     args: &[&str],
     timeout: Duration,
