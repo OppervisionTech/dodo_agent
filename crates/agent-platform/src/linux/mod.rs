@@ -396,10 +396,17 @@ impl Platform for LinuxPlatform {
         let hugepages_total = kv.get("HugePages_Total").copied().unwrap_or(0);
         let hugepages_free = kv.get("HugePages_Free").copied().unwrap_or(0);
 
-        let used = total
-            .saturating_sub(free)
-            .saturating_sub(buffers)
-            .saturating_sub(cached);
+        // Used = MemTotal - MemAvailable, the same number `free`, Datadog and
+        // Dynatrace show. Kernels without MemAvailable (< 3.14) fall back to
+        // total - free - buffers - cached.
+        let used = if available > 0 {
+            total.saturating_sub(available)
+        } else {
+            total
+                .saturating_sub(free)
+                .saturating_sub(buffers)
+                .saturating_sub(cached)
+        };
 
         Ok(MemoryInfo {
             total_bytes: total,
@@ -467,8 +474,12 @@ impl Platform for LinuxPlatform {
 
             let block_size = filesystem_count(stat.f_frsize);
             let total_bytes = filesystem_count(stat.f_blocks) * block_size;
-            let free_bytes = filesystem_count(stat.f_bfree) * block_size;
-            let used_bytes = total_bytes.saturating_sub(free_bytes);
+            let used_bytes =
+                total_bytes.saturating_sub(filesystem_count(stat.f_bfree) * block_size);
+            // Free = what unprivileged users can still write (df's "Avail"),
+            // so used / (used + free) matches df's Use% (root-reserved blocks
+            // are neither used nor free).
+            let free_bytes = filesystem_count(stat.f_bavail) * block_size;
 
             // Skip zero-size filesystems
             if total_bytes == 0 {

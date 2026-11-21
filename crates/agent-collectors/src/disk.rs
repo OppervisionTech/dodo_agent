@@ -82,8 +82,10 @@ impl Collector for DiskCollector {
                             "gauge",
                         ));
 
-                        let usage_pct = if ds.total_bytes > 0 {
-                            (ds.used_bytes as f64 / ds.total_bytes as f64) * 100.0
+                        // df's Use%: used / (used + available to users).
+                        let usable = ds.used_bytes.saturating_add(ds.free_bytes);
+                        let usage_pct = if usable > 0 {
+                            (ds.used_bytes as f64 / usable as f64) * 100.0
                         } else {
                             0.0
                         };

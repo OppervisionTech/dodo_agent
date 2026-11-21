@@ -343,6 +343,8 @@ pub(crate) mod otlp {
     pub struct LogRecord {
         #[prost(fixed64, tag = "1")]
         pub time_unix_nano: u64,
+        #[prost(fixed64, tag = "11")]
+        pub observed_time_unix_nano: u64,
         #[prost(enumeration = "SeverityNumber", tag = "2")]
         pub severity_number: i32,
         #[prost(string, tag = "3")]
@@ -735,14 +737,25 @@ fn convert_logs(req: &otlp::ExportLogsServiceRequest) -> Vec<Envelope> {
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect();
 
-                envelopes.push(helpers::log_envelope(
+                let mut env = helpers::log_envelope(
                     &body,
                     severity,
                     "otel",
                     &attr_refs,
                     trace_id.as_deref(),
                     span_id.as_deref(),
-                ));
+                );
+                // Keep the time the app logged it, not when the agent batched
+                // it: logs must line up with the spans and metrics they explain.
+                let event_ns = if record.time_unix_nano > 0 {
+                    record.time_unix_nano
+                } else {
+                    record.observed_time_unix_nano
+                };
+                if event_ns > 0 && event_ns <= i64::MAX as u64 {
+                    env.timestamp_unix_ns = event_ns as i64;
+                }
+                envelopes.push(env);
             }
         }
     }
@@ -1700,6 +1713,7 @@ mod tests {
                     scope: None,
                     log_records: vec![otlp::LogRecord {
                         time_unix_nano: 100,
+                        observed_time_unix_nano: 0,
                         severity_number: 17, // ERROR
                         severity_text: "ERROR".to_string(),
                         body: Some(otlp::AnyValue {
