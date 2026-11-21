@@ -4,7 +4,7 @@ use rcgen::{
 };
 use std::io::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 use x509_parser::prelude::FromDer as _;
 
 const RENEWAL_THRESHOLD_SECS: i64 = 7 * 86_400;
@@ -141,7 +141,14 @@ pub async fn enroll_if_needed(
         return Ok(());
     }
 
-    if !cert_needs_renewal(client_cert_path) {
+    // The server records host_id only on enrollment. A host id that changed
+    // since then (e.g. DODO_HOST_ID set on a sidecar that already had certs)
+    // would keep billing the machine under its old identity, so re-enroll.
+    let host_id_path = format!("{certs_dir}/host-id");
+    let host_changed = std::fs::read_to_string(&host_id_path)
+        .map(|s| s.trim() != host_id)
+        .unwrap_or(true);
+    if !cert_needs_renewal(client_cert_path) && !host_changed {
         // JWT lives only in memory. Warm restarts must refresh before starting
         // transport even though their long-lived certificate is still valid.
         refresh_token(enrollment_endpoint, api_key, agent_id, certs_dir, token).await?;
@@ -198,6 +205,10 @@ pub async fn enroll_if_needed(
         certs_dir,
     )
     .context("writing certificates to disk")?;
+
+    if let Err(e) = write_private_file(&host_id_path, host_id.as_bytes()) {
+        warn!(error = %e, "could not record enrolled host id");
+    }
 
     info!(expires_at = %enroll.expires_at, "enrollment complete — mTLS certificates installed");
 
@@ -397,8 +408,23 @@ mod tests {
             std::fs::read_to_string(certs.join("agent-key.pem")).unwrap(),
             original_key
         );
+        // Host identity changed (e.g. DODO_HOST_ID set later): re-enroll so
+        // the server records the new host_id.
+        enroll_if_needed(
+            &endpoint,
+            "synthetic-key",
+            "agent",
+            "pinned-host",
+            path.to_str().unwrap(),
+            certs.to_str().unwrap(),
+            &token,
+        )
+        .await
+        .unwrap();
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].0, "/v1/enroll");
+        assert_eq!(requests[2].1["host_id"], "pinned-host");
         assert_eq!(requests[0].0, "/v1/enroll");
         assert_eq!(requests[0].1["host_id"], "host");
         assert_eq!(requests[1].0, "/v1/token/refresh");
