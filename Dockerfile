@@ -70,6 +70,18 @@ RUN case "${TARGETARCH}" in \
     cp "target/${TARGET}/release/aegis-agent" /aegis-agent
 
 # ---------- Stage 2: Runtime ----------
+# kubectl for in-cluster remediation (dodo.io/v1 Remediation, off by
+# default): pinned release, checksum-verified.
+FROM rust:latest AS kubectl
+ARG TARGETARCH=amd64
+ARG KUBECTL_VERSION=v1.31.4
+RUN case "${TARGETARCH}" in \
+        amd64) SUM=298e19e9c6c17199011404278f0ff8168a7eca4217edad9097af577023a5620f ;; \
+        arm64) SUM=b97e93c20e3be4b8c8fa1235a41b4d77d4f2022ed3d899230dbbbbd43d26f872 ;; \
+    esac && \
+    curl -fsSLo /kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" && \
+    echo "${SUM}  /kubectl" | sha256sum -c - && chmod 0755 /kubectl
+
 FROM gcr.io/distroless/static-debian12
 
 LABEL org.opencontainers.image.title="DoDo AegisOps Agent"
@@ -78,6 +90,7 @@ LABEL org.opencontainers.image.vendor="Oppervision"
 LABEL org.opencontainers.image.source="https://github.com/OppervisionTech/dodo_agent"
 
 COPY --from=builder /aegis-agent /usr/local/bin/aegis-agent
+COPY --from=kubectl /kubectl /usr/local/bin/kubectl
 COPY config/agent.yaml /etc/aegis/agent.yaml
 
 # Config and data directories are expected to be mounted

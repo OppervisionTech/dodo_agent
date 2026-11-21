@@ -52,6 +52,7 @@ pub(crate) async fn run(doc: &Value) -> Result<String, CommandError> {
             }
             submit_to_runner(&spec, &script_socket()).await
         }
+        Some("Remediation") => crate::remediation::run(&spec).await,
         Some("HttpRequest") => {
             let allow = std::env::var("DODO_HTTP_ALLOW").unwrap_or_default();
             http_request(&spec, env_flag("DODO_ALLOW_HTTP"), &allow).await

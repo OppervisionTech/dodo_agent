@@ -37,7 +37,34 @@ pub fn cert_needs_renewal(path: &str) -> bool {
 struct EnrollRequest<'a> {
     agent_id: &'a str,
     host_id: &'a str,
+    /// host | node | sidecar: several agents may share one host (systemd on
+    /// the machine, a DaemonSet pod, an app sidecar); the server only
+    /// replaces a previous agent of the same role on that host.
+    role: &'a str,
     csr_pem: String,
+}
+
+/// This agent's role on its host. `DODO_AGENT_ROLE` overrides; otherwise a
+/// pod with NODE_NAME (DaemonSet downward API) is a node agent, any other
+/// pod a sidecar, and outside Kubernetes the host agent.
+pub fn agent_role() -> &'static str {
+    match std::env::var("DODO_AGENT_ROLE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("host") => return "host",
+        Some("node") => return "node",
+        Some("sidecar") => return "sidecar",
+        _ => {}
+    }
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_none() {
+        "host"
+    } else if std::env::var_os("NODE_NAME").is_some() {
+        "node"
+    } else {
+        "sidecar"
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -151,8 +178,17 @@ pub async fn enroll_if_needed(
     if !cert_needs_renewal(client_cert_path) && !host_changed {
         // JWT lives only in memory. Warm restarts must refresh before starting
         // transport even though their long-lived certificate is still valid.
-        refresh_token(enrollment_endpoint, api_key, agent_id, certs_dir, token).await?;
-        return Ok(());
+        match refresh_token(enrollment_endpoint, api_key, agent_id, certs_dir, token).await {
+            Ok(_) => return Ok(()),
+            // 403: the server no longer accepts this agent (replaced by another
+            // registration on the host, or revoked). Enrolling again with the
+            // API key and the same key pair reactivates it instead of leaving
+            // the pod crash-looping; a revoked agent is still refused there.
+            Err(e) if e.to_string().contains("403") => {
+                warn!(error = %e, "token refresh refused — enrolling again");
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     info!(
@@ -185,6 +221,7 @@ pub async fn enroll_if_needed(
         .json(&EnrollRequest {
             agent_id,
             host_id,
+            role: agent_role(),
             csr_pem,
         })
         .send()
@@ -345,6 +382,54 @@ mod tests {
             refresh_endpoint("https://example.test/"),
             "https://example.test/v1/token/refresh"
         );
+    }
+
+    #[tokio::test]
+    async fn refused_refresh_enrolls_again_with_the_same_key() {
+        let directory = crate::test_network::Directory::new();
+        let cert = Certificate::from_params(CertificateParams::default())
+            .unwrap()
+            .serialize_pem()
+            .unwrap();
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = paths.clone();
+        let response_cert = cert.clone();
+        let server = crate::test_network::http(move |request| {
+            let path = request.uri().path().to_string();
+            captured.lock().unwrap().push(path.clone());
+            if path == "/v1/enroll" {
+                let body = serde_json::json!({"ca_cert_pem":response_cert,
+                    "agent_cert_pem":response_cert, "expires_at":"future",
+                    "agent_jwt":"enrolled-token"});
+                (200, serde_json::to_vec(&body).unwrap())
+            } else {
+                (403, b"{}".to_vec()) // replaced by another agent on the host
+            }
+        })
+        .await;
+        let endpoint = format!("http://{}/v1/enroll", server.address);
+        let path = directory.0.join("certs/agent.pem");
+        let certs = directory.0.join("certs");
+        let token = crate::SharedToken::default();
+        for _ in 0..2 {
+            enroll_if_needed(
+                &endpoint,
+                "synthetic-key",
+                "agent",
+                "host",
+                path.to_str().unwrap(),
+                certs.to_str().unwrap(),
+                &token,
+            )
+            .await
+            .unwrap();
+        }
+        // enroll, then refresh (403) → enroll again instead of failing.
+        assert_eq!(
+            *paths.lock().unwrap(),
+            ["/v1/enroll", "/v1/token/refresh", "/v1/enroll"]
+        );
+        assert_eq!(token.read().unwrap().as_deref(), Some("enrolled-token"));
     }
 
     #[tokio::test]
@@ -553,12 +638,14 @@ mod tests {
         let req = EnrollRequest {
             agent_id: "11111111-1111-4111-8111-111111111111",
             host_id: "22222222-2222-4222-8222-222222222222",
+            role: "node",
             csr_pem: "-----BEGIN CERTIFICATE REQUEST-----\n...".to_string(),
         };
 
         let value = serde_json::to_value(&req).expect("EnrollRequest must serialize");
         assert_eq!(value["agent_id"], "11111111-1111-4111-8111-111111111111");
         assert_eq!(value["host_id"], "22222222-2222-4222-8222-222222222222");
+        assert_eq!(value["role"], "node");
         assert!(value["csr_pem"].as_str().unwrap().starts_with("-----BEGIN"));
     }
 }
