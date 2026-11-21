@@ -50,8 +50,21 @@ pub(crate) fn argv(
             "namespace {ns} is not in DODO_REMEDIATION_NAMESPACES"
         )));
     }
+    let dry_run = spec
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let target = format!("deployment/{deployment}");
     let mut args: Vec<String> = match action {
+        // `rollout restart` has no --dry-run: its dry run patches the same
+        // annotation server-side (checks the Deployment and RBAC, changes nothing).
+        "rollout_restart" if dry_run => vec![
+            "patch".into(),
+            target,
+            "--type=merge".into(),
+            "-p".into(),
+            r#"{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"dry-run"}}}}}"#.into(),
+        ],
         "rollout_restart" => vec!["rollout".into(), "restart".into(), target],
         "rollback" => {
             let mut a = vec!["rollout".into(), "undo".into(), target];
@@ -135,6 +148,10 @@ mod tests {
                 "shop"
             ]
         );
+        let dry = ok(json!({"action": "rollout_restart", "namespace": "shop",
+                             "deployment": "api", "dry_run": true}));
+        assert_eq!(dry[..2], ["patch", "deployment/api"]);
+        assert_eq!(dry.last().map(String::as_str), Some("--dry-run=server"));
     }
 
     #[test]
