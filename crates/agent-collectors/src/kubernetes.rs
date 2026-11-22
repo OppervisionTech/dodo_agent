@@ -435,6 +435,8 @@ struct SeenPod {
     name: String,
     workload: String,
     workload_kind: String,
+    /// pod-template-hash / controller-revision-hash: which revision it ran.
+    revision: String,
 }
 
 /// Pod lifecycle on this node between scans: container restarts (OOMKilled,
@@ -548,6 +550,9 @@ impl PodLifecycle {
                     ));
                 }
             }
+            let revision = label(pod, "pod-template-hash")
+                .or_else(|| label(pod, "controller-revision-hash"))
+                .unwrap_or_default();
             seen.insert(
                 uid.to_string(),
                 SeenPod {
@@ -555,6 +560,7 @@ impl PodLifecycle {
                     name: name.to_string(),
                     workload,
                     workload_kind,
+                    revision,
                 },
             );
         }
@@ -564,6 +570,18 @@ impl PodLifecycle {
         if primed {
             for (uid, p) in &self.pods {
                 if seen.contains_key(uid) {
+                    continue;
+                }
+                // Replaced by a rollout (a pod of the same workload now runs
+                // another revision): a deploy, not a failure.
+                let rolled = !p.revision.is_empty()
+                    && seen.values().any(|q| {
+                        q.namespace == p.namespace
+                            && q.workload == p.workload
+                            && !q.revision.is_empty()
+                            && q.revision != p.revision
+                    });
+                if rolled {
                     continue;
                 }
                 *gone
@@ -997,6 +1015,27 @@ mod tests {
             true,
         );
         assert_eq!(logs(&out), 1);
+    }
+
+    #[test]
+    fn pod_replaced_by_a_rollout_is_not_reported() {
+        let with_rev = |uid: &str, name: &str, rev: &str| {
+            let mut p = pod(uid, name, 0, "");
+            p["metadata"]["labels"] = json!({"pod-template-hash": rev});
+            p
+        };
+        let mut lc = PodLifecycle::default();
+        lc.scan(
+            &json!({"items": [with_rev("u1", "api-1", "aaa")]}),
+            "n1",
+            false,
+        );
+        let out = lc.scan(
+            &json!({"items": [with_rev("u2", "api-2", "bbb")]}),
+            "n1",
+            true,
+        );
+        assert_eq!(logs(&out), 0);
     }
 
     #[test]
