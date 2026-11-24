@@ -31,6 +31,11 @@ struct PortKey {
     bind_address: String,
 }
 
+fn is_loopback(addr: &str) -> bool {
+    let a = addr.trim_start_matches('[').trim_end_matches(']');
+    a.starts_with("127.") || a == "::1" || a == "localhost"
+}
+
 impl From<&ListeningPort> for PortKey {
     fn from(lp: &ListeningPort) -> Self {
         Self {
@@ -51,6 +56,9 @@ struct PreviousState {
 pub struct SecurityCollector {
     platform: Arc<dyn Platform>,
     previous: Mutex<Option<PreviousState>>,
+    /// Ports already reported since the agent started: a dev server or a
+    /// short-lived listener that comes and goes is one event, not one per cycle.
+    seen_ports: Mutex<HashSet<PortKey>>,
     monitored_files: Vec<String>,
 }
 
@@ -76,6 +84,7 @@ impl SecurityCollector {
         Self {
             platform,
             previous: Mutex::new(None),
+            seen_ports: Mutex::new(HashSet::new()),
             monitored_files,
         }
     }
@@ -147,8 +156,13 @@ impl Collector for SecurityCollector {
                 let prev_keys: HashSet<&PortKey> = prev.ports.keys().collect();
                 let curr_keys: HashSet<&PortKey> = current_port_map.keys().collect();
 
-                // New ports (in current but not in previous)
+                // New ports (in current but not in previous). Loopback binds are
+                // not reachable from outside, and a port seen before is not new.
+                let mut seen = self.seen_ports.lock().await;
                 for key in curr_keys.difference(&prev_keys) {
+                    if is_loopback(&key.bind_address) || !seen.insert((*key).clone()) {
+                        continue;
+                    }
                     if let Some(lp) = current_port_map.get(key) {
                         tracing::info!(
                             port = lp.port,
@@ -177,6 +191,10 @@ impl Collector for SecurityCollector {
 
                 // Removed ports (in previous but not in current)
                 for key in prev_keys.difference(&curr_keys) {
+                    // A listener that already came and went once stays quiet.
+                    if is_loopback(&key.bind_address) || !seen.insert((*key).clone()) {
+                        continue;
+                    }
                     if let Some(lp) = prev.ports.get(key) {
                         tracing::info!(
                             port = lp.port,
@@ -334,5 +352,15 @@ mod tests {
             collector.monitored_files.len(),
             DEFAULT_MONITORED_FILES.len() + 1
         );
+    }
+
+    #[test]
+    fn loopback_binds_are_not_exposed() {
+        for a in ["127.0.0.1", "127.0.0.53", "::1", "[::1]", "localhost"] {
+            assert!(is_loopback(a), "{a}");
+        }
+        for a in ["0.0.0.0", "::", "192.168.0.10", "10.244.0.5"] {
+            assert!(!is_loopback(a), "{a}");
+        }
     }
 }
