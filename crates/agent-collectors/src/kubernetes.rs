@@ -473,6 +473,7 @@ impl PodLifecycle {
                 continue;
             }
             let (workload_kind, workload) = pod_workload(pod);
+            let terminating = pod.pointer("/metadata/deletionTimestamp").is_some();
             let statuses = pod
                 .pointer("/status/containerStatuses")
                 .and_then(Value::as_array)
@@ -501,8 +502,11 @@ impl PodLifecycle {
                 let before = self.restarts.get(&key).copied();
                 restarts.insert(key, count);
                 // A pod seen for the first time brings its old restarts: not new.
+                // A pod being deleted is not restarting either: kubelet may bump
+                // restartCount while it tears containers down (kubectl delete,
+                // rollout), which read as a crash next to the real "terminated".
                 let increase = match before {
-                    Some(b) if primed && count > b => count - b,
+                    Some(b) if primed && !terminating && count > b => count - b,
                     _ => 0,
                 };
                 let reason = c
@@ -1015,6 +1019,16 @@ mod tests {
             true,
         );
         assert_eq!(logs(&out), 1);
+    }
+
+    #[test]
+    fn restart_while_terminating_is_not_reported() {
+        let mut lc = PodLifecycle::default();
+        lc.scan(&json!({"items": [pod("u1", "api-1", 0, "")]}), "n1", false);
+        let mut dying = pod("u1", "api-1", 1, "Error");
+        dying["metadata"]["deletionTimestamp"] = json!("2026-11-24T01:13:49Z");
+        let out = lc.scan(&json!({"items": [dying]}), "n1", true);
+        assert_eq!(logs(&out), 0, "a pod being deleted is not a restart");
     }
 
     #[test]
