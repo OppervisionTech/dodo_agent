@@ -57,8 +57,9 @@ pub struct PortPolicy {
     pub learning: Duration,
     /// Ports that never alert (e.g. 22, 80, 443).
     pub allow_ports: HashSet<u16>,
-    /// Process names whose ports never alert.
-    pub allow_processes: HashSet<String>,
+    /// (process name, port) pairs that never alert. A name alone is not
+    /// trusted: any binary can be called "nginx".
+    pub allow_process_ports: HashSet<(String, u16)>,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -169,7 +170,10 @@ impl SecurityCollector {
         first_time
             && !mem.learning(self.policy.learning)
             && !self.policy.allow_ports.contains(&key.port)
-            && !self.policy.allow_processes.contains(process)
+            && !self
+                .policy
+                .allow_process_ports
+                .contains(&(process.to_string(), key.port))
     }
 }
 
@@ -530,12 +534,14 @@ mod tests {
 
         let allow = collector(PortPolicy {
             allow_ports: [443].into_iter().collect(),
-            allow_processes: ["nginx".to_string()].into_iter().collect(),
+            allow_process_ports: [("nginx".to_string(), 8081)].into_iter().collect(),
             ..Default::default()
         });
         let mut mem = allow.seen_ports.lock().await;
         assert!(!allow.should_alert(&mut mem, &key(443), "x"));
         assert!(!allow.should_alert(&mut mem, &key(8081), "nginx"));
+        // Same name on another port is not trusted.
+        assert!(allow.should_alert(&mut mem, &key(8082), "nginx"));
         assert!(!allow.should_alert(
             &mut mem,
             &PortKey {

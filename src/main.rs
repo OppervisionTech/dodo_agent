@@ -521,7 +521,8 @@ fn register_collectors(
                     .get("monitored_files")
                     .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
                 // Port alert noise: seen ports persist next to agent_id, a
-                // learning baseline (default 24h) and an allowlist stay quiet.
+                // learning baseline (default 24h) and allowlisted ports or
+                // (process, port) pairs stay quiet.
                 let list = |k: &str, d: &str| -> Vec<String> {
                     cc.parameters
                         .get(k)
@@ -552,8 +553,13 @@ fn register_collectors(
                         .iter()
                         .filter_map(|s| s.parse().ok())
                         .collect(),
-                    allow_processes: list("process_allowlist", "sshd,nginx,kubelet,containerd")
-                        .into_iter()
+                    // "name:port" pairs; empty by default (a name alone is spoofable).
+                    allow_process_ports: list("process_port_allowlist", "")
+                        .iter()
+                        .filter_map(|s| {
+                            let (name, port) = s.rsplit_once(':')?;
+                            Some((name.to_string(), port.parse().ok()?))
+                        })
                         .collect(),
                 };
                 registry.register(Box::new(
