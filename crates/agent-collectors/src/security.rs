@@ -6,8 +6,9 @@
 //! FILE_INTEGRITY (hash changes on monitored files).
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_core::{Collector, CollectorError, Envelope, SignalType};
 use agent_platform::{ListeningPort, Platform};
@@ -24,7 +25,7 @@ const DEFAULT_MONITORED_FILES: &[&str] = &[
 ];
 
 /// Snapshot of a listening port for comparison.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PortKey {
     port: u16,
     protocol: String,
@@ -46,6 +47,65 @@ impl From<&ListeningPort> for PortKey {
     }
 }
 
+/// Port alert policy: where seen ports persist, how long the learning
+/// baseline lasts, and which ports/processes never alert.
+#[derive(Debug, Clone, Default)]
+pub struct PortPolicy {
+    /// File that keeps seen ports across restarts. `None` keeps them in memory.
+    pub state_path: Option<PathBuf>,
+    /// After the first start, ports are only learned (no alerts) for this long.
+    pub learning: Duration,
+    /// Ports that never alert (e.g. 22, 80, 443).
+    pub allow_ports: HashSet<u16>,
+    /// Process names whose ports never alert.
+    pub allow_processes: HashSet<String>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PortMemory {
+    /// Unix seconds of the first start that created this file.
+    learning_started_at: u64,
+    ports: HashSet<PortKey>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl PortMemory {
+    fn load(path: Option<&PathBuf>) -> Self {
+        let loaded = path
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<PortMemory>(&b).ok());
+        loaded.unwrap_or_else(|| PortMemory {
+            learning_started_at: now_secs(),
+            ports: HashSet::new(),
+        })
+    }
+
+    fn save(&self, path: Option<&PathBuf>) {
+        let Some(path) = path else { return };
+        let result = (|| -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, serde_json::to_vec(self).unwrap_or_default())?;
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = result {
+            tracing::warn!(path = %path.display(), error = %e, "could not persist seen ports");
+        }
+    }
+
+    fn learning(&self, window: Duration) -> bool {
+        now_secs().saturating_sub(self.learning_started_at) < window.as_secs()
+    }
+}
+
 /// Previous state for change detection.
 struct PreviousState {
     ports: HashMap<PortKey, ListeningPort>,
@@ -58,7 +118,9 @@ pub struct SecurityCollector {
     previous: Mutex<Option<PreviousState>>,
     /// Ports already reported since the agent started: a dev server or a
     /// short-lived listener that comes and goes is one event, not one per cycle.
-    seen_ports: Mutex<HashSet<PortKey>>,
+    /// Persisted to `policy.state_path` so a restart does not re-alert.
+    seen_ports: Mutex<PortMemory>,
+    policy: PortPolicy,
     monitored_files: Vec<String>,
 }
 
@@ -84,9 +146,30 @@ impl SecurityCollector {
         Self {
             platform,
             previous: Mutex::new(None),
-            seen_ports: Mutex::new(HashSet::new()),
+            seen_ports: Mutex::new(PortMemory::load(None)),
+            policy: PortPolicy::default(),
             monitored_files,
         }
+    }
+
+    /// Apply a port policy: loads persisted seen ports from `state_path`.
+    pub fn with_port_policy(mut self, policy: PortPolicy) -> Self {
+        self.seen_ports = Mutex::new(PortMemory::load(policy.state_path.as_ref()));
+        self.policy = policy;
+        self
+    }
+
+    /// True when a port change should alert: not loopback, not allowlisted,
+    /// not seen before (recorded either way), and past the learning window.
+    fn should_alert(&self, mem: &mut PortMemory, key: &PortKey, process: &str) -> bool {
+        if is_loopback(&key.bind_address) {
+            return false;
+        }
+        let first_time = mem.ports.insert(key.clone());
+        first_time
+            && !mem.learning(self.policy.learning)
+            && !self.policy.allow_ports.contains(&key.port)
+            && !self.policy.allow_processes.contains(process)
     }
 }
 
@@ -159,8 +242,13 @@ impl Collector for SecurityCollector {
                 // New ports (in current but not in previous). Loopback binds are
                 // not reachable from outside, and a port seen before is not new.
                 let mut seen = self.seen_ports.lock().await;
+                let before = seen.ports.len();
                 for key in curr_keys.difference(&prev_keys) {
-                    if is_loopback(&key.bind_address) || !seen.insert((*key).clone()) {
+                    let process = current_port_map
+                        .get(*key)
+                        .map(|lp| lp.process_name.as_str())
+                        .unwrap_or("");
+                    if !self.should_alert(&mut seen, key, process) {
                         continue;
                     }
                     if let Some(lp) = current_port_map.get(key) {
@@ -172,7 +260,7 @@ impl Collector for SecurityCollector {
                         );
                         envelopes.push(security_event_envelope(
                             "PORT_CHANGE",
-                            "medium",
+                            "low",
                             &format!(
                                 "New listening port detected: {}:{}/{} ({})",
                                 lp.bind_address, lp.port, lp.protocol, lp.process_name
@@ -192,7 +280,12 @@ impl Collector for SecurityCollector {
                 // Removed ports (in previous but not in current)
                 for key in prev_keys.difference(&curr_keys) {
                     // A listener that already came and went once stays quiet.
-                    if is_loopback(&key.bind_address) || !seen.insert((*key).clone()) {
+                    let process = prev
+                        .ports
+                        .get(*key)
+                        .map(|lp| lp.process_name.as_str())
+                        .unwrap_or("");
+                    if !self.should_alert(&mut seen, key, process) {
                         continue;
                     }
                     if let Some(lp) = prev.ports.get(key) {
@@ -219,6 +312,11 @@ impl Collector for SecurityCollector {
                         ));
                     }
                 }
+
+                if seen.ports.len() != before {
+                    seen.save(self.policy.state_path.as_ref());
+                }
+                drop(seen);
 
                 // --- File integrity changes ---
                 for (path, current_hash) in &current_file_hashes {
@@ -287,6 +385,23 @@ impl Collector for SecurityCollector {
                     files = current_file_hashes.len(),
                     "security collector: initial snapshot captured"
                 );
+            }
+
+            if prev_guard.is_none() {
+                // Baseline: ports open at start are known, so their later
+                // close/reopen stays quiet across restarts too.
+                let mut seen = self.seen_ports.lock().await;
+                let before = seen.ports.len();
+                for key in current_port_map.keys() {
+                    if !is_loopback(&key.bind_address) {
+                        seen.ports.insert(key.clone());
+                    }
+                }
+                if seen.ports.len() != before
+                    || self.policy.state_path.as_ref().is_some_and(|p| !p.exists())
+                {
+                    seen.save(self.policy.state_path.as_ref());
+                }
             }
 
             // Store current state as previous
@@ -362,5 +477,73 @@ mod tests {
         for a in ["0.0.0.0", "::", "192.168.0.10", "10.244.0.5"] {
             assert!(!is_loopback(a), "{a}");
         }
+    }
+
+    fn key(port: u16) -> PortKey {
+        PortKey {
+            port,
+            protocol: "tcp".into(),
+            bind_address: "0.0.0.0".into(),
+        }
+    }
+
+    fn collector(policy: PortPolicy) -> SecurityCollector {
+        let platform = Arc::new(MockPlatform::new()) as Arc<dyn Platform>;
+        SecurityCollector::new(platform, None).with_port_policy(policy)
+    }
+
+    #[tokio::test]
+    async fn seen_port_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("seen-ports-{}", std::process::id()));
+        let path = dir.join("seen_ports.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let policy = PortPolicy {
+            state_path: Some(path.clone()),
+            ..Default::default()
+        };
+
+        let first = collector(policy.clone());
+        {
+            let mut mem = first.seen_ports.lock().await;
+            assert!(first.should_alert(&mut mem, &key(8080), "node"));
+            mem.save(policy.state_path.as_ref());
+        }
+
+        // "Restart": a new collector loads the file and stays quiet.
+        let second = collector(policy);
+        let mut mem = second.seen_ports.lock().await;
+        assert!(!second.should_alert(&mut mem, &key(8080), "node"));
+        assert!(second.should_alert(&mut mem, &key(9090), "node"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn learning_window_and_allowlist_suppress() {
+        let learning = collector(PortPolicy {
+            learning: Duration::from_secs(24 * 3600),
+            ..Default::default()
+        });
+        let mut mem = learning.seen_ports.lock().await;
+        assert!(!learning.should_alert(&mut mem, &key(8080), "node"));
+        assert!(mem.ports.contains(&key(8080)), "learned during baseline");
+        drop(mem);
+
+        let allow = collector(PortPolicy {
+            allow_ports: [443].into_iter().collect(),
+            allow_processes: ["nginx".to_string()].into_iter().collect(),
+            ..Default::default()
+        });
+        let mut mem = allow.seen_ports.lock().await;
+        assert!(!allow.should_alert(&mut mem, &key(443), "x"));
+        assert!(!allow.should_alert(&mut mem, &key(8081), "nginx"));
+        assert!(!allow.should_alert(
+            &mut mem,
+            &PortKey {
+                bind_address: "127.0.0.1".into(),
+                ..key(9000)
+            },
+            "x"
+        ));
+        assert!(allow.should_alert(&mut mem, &key(9001), "x"));
     }
 }

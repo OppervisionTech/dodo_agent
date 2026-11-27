@@ -44,7 +44,7 @@ pub use memory::MemoryCollector;
 pub use network::NetworkCollector;
 pub use otel::OtelCollector;
 pub use process::ProcessCollector;
-pub use security::SecurityCollector;
+pub use security::{PortPolicy, SecurityCollector};
 pub use self_metrics::SelfMetricsCollector;
 
 #[cfg(feature = "docker")]
