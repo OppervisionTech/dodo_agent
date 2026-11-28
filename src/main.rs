@@ -520,10 +520,52 @@ fn register_collectors(
                     .parameters
                     .get("monitored_files")
                     .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
-                registry.register(Box::new(agent_collectors::SecurityCollector::new(
-                    platform.clone(),
-                    monitored_files,
-                )));
+                // Port alert noise: seen ports persist next to agent_id, a
+                // learning baseline (default 24h) and allowlisted ports or
+                // (process, port) pairs stay quiet.
+                let list = |k: &str, d: &str| -> Vec<String> {
+                    cc.parameters
+                        .get(k)
+                        .map(String::as_str)
+                        .unwrap_or(d)
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+                let state_path = cc
+                    .parameters
+                    .get("seen_ports_path")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(&config.agent_id_path)
+                            .with_file_name("seen_ports.json")
+                    });
+                let learning_hours: u64 = cc
+                    .parameters
+                    .get("port_learning_hours")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(24);
+                let policy = agent_collectors::PortPolicy {
+                    state_path: Some(state_path),
+                    learning: std::time::Duration::from_secs(learning_hours * 3600),
+                    allow_ports: list("port_allowlist", "22,80,443")
+                        .iter()
+                        .filter_map(|s| s.parse().ok())
+                        .collect(),
+                    // "name:port" pairs; empty by default (a name alone is spoofable).
+                    allow_process_ports: list("process_port_allowlist", "")
+                        .iter()
+                        .filter_map(|s| {
+                            let (name, port) = s.rsplit_once(':')?;
+                            Some((name.to_string(), port.parse().ok()?))
+                        })
+                        .collect(),
+                };
+                registry.register(Box::new(
+                    agent_collectors::SecurityCollector::new(platform.clone(), monitored_files)
+                        .with_port_policy(policy),
+                ));
             }
             "certs" => {
                 let scan_paths = cc
